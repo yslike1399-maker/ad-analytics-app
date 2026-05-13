@@ -1,0 +1,28 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# 업로드된 사용자 데이터 (실수로 커밋 방지)
+uploads/
+*.xlsx
+!samples/*.xlsx
+
+# 개인 백업/내보내기 파일
+*_백업_*.json
+광고분석_*.json
+
+# 네이버 검색광고 API 자격증명 (절대 커밋 금지)
+naver_credentials.json
+.env.naver
+samples/naver_api_*.json
+samples/naver_api_*.csv
+samples/naver_api_*.tsv
+
+# 분석 임시 스크립트 출력
+samples/_*.py
+samples/*.py.log

@@ -1,0 +1,2526 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>광고분석</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='black'/><text x='6' y='23' font-family='Arial' font-weight='900' font-size='18' fill='white'>광</text></svg>">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
+    <style>
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+      const { useState, useEffect, useRef, useMemo } = React;
+
+      const APP_VERSION = 'v20260513.20';
+
+      // ───────── 아이콘 (인라인 SVG) ─────────
+      const Upload = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>;
+      const Download = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>;
+
+      // ───────── 플랫폼별 엑셀 파서 정의 ─────────
+      // 각 플랫폼이 다운로드 제공하는 엑셀의 컬럼명을 통합 스키마로 매핑.
+      // detect: 헤더 배열을 받아 그 플랫폼인지 판단 (불리언)
+      // mapping: 통합 필드 → 그 플랫폼의 컬럼명 후보 배열 (앞쪽이 우선)
+      const PLATFORM_PARSERS = {
+        naver: {
+          name: '네이버',
+          detect: (headers) =>
+            headers.some(h => /총비용\(VAT/.test(h)) ||
+            headers.some(h => /^키워드$/.test(h)) ||
+            headers.some(h => /전환매출액/.test(h)),
+          mapping: {
+            campaign:    ['캠페인'],
+            adType:      ['광고그룹유형', '캠페인유형'],  // 파워링크 / 쇼핑검색 / 브랜드검색 구분
+            adGroup:     ['광고그룹'],
+            keyword:     ['키워드', '검색어'],  // 수동 다운로드 검색어 보고서 호환
+            date:        ['일별', '일자', '날짜'],
+            impressions: ['노출수'],
+            clicks:      ['클릭수'],
+            cost:        ['총비용(VAT포함)', '총비용', '광고비', '비용'],
+            conversions: ['전환수', '전환건수'],
+            revenue:     ['전환매출액', '매출'],
+          },
+        },
+        kakao: {
+          name: '카카오',
+          detect: (headers) =>
+            headers.some(h => /광고그룹/.test(h)) ||
+            headers.some(h => /지출금액/.test(h)),
+          mapping: {
+            campaign:    ['캠페인명', '캠페인'],
+            adType:      ['광고그룹유형', '캠페인유형', '광고유형'],
+            adGroup:     ['광고그룹', '광고세트'],
+            keyword:     ['키워드'],
+            date:        ['날짜', '일별'],
+            impressions: ['노출수', '노출'],
+            clicks:      ['클릭수', '클릭'],
+            cost:        ['지출금액', '광고비', '비용'],
+            conversions: ['전환수'],
+            revenue:     ['전환매출', '전환매출액', '매출'],
+          },
+        },
+        meta: {
+          name: '메타 (인스타/페북)',
+          detect: (headers) =>
+            headers.some(h => /Campaign name/i.test(h)) ||
+            headers.some(h => /Amount spent/i.test(h)) ||
+            headers.some(h => /캠페인 이름/.test(h)),
+          mapping: {
+            campaign:    ['Campaign name', '캠페인 이름'],
+            adGroup:     ['Ad set name', '광고 세트 이름', '광고세트 이름'],
+            date:        ['Day', 'Reporting starts', '시작일', '날짜'],
+            impressions: ['Impressions', '노출'],
+            clicks:      ['Link clicks', 'Clicks (all)', '링크 클릭', '클릭(전체)'],
+            cost:        ['Amount spent (KRW)', 'Amount spent', '지출 금액'],
+            conversions: ['Results', 'Purchases', '결과', '구매'],
+            revenue:     ['Purchases conversion value', 'Website purchases conversion value', '구매 전환 가치'],
+          },
+        },
+      };
+
+      // 헤더 행 위치 자동 탐색 (보고서 메타데이터가 앞에 있는 경우 대비)
+      const findHeaderRowIdx = (rows) => {
+        for (let i = 0; i < Math.min(rows.length, 20); i++) {
+          const r = (rows[i] || []).map(c => String(c ?? '').trim());
+          if (r.some(c => /캠페인|Campaign/i.test(c))) return i;
+        }
+        return 0;
+      };
+
+      const detectPlatform = (headers) => {
+        for (const [key, p] of Object.entries(PLATFORM_PARSERS)) {
+          if (p.detect(headers)) return key;
+        }
+        return null;
+      };
+
+      // 컬럼 후보 배열에서 헤더 인덱스 탐색 (완전 일치 우선 → 부분 일치)
+      const findColumnIdx = (headers, candidates) => {
+        for (const cand of candidates) {
+          const i = headers.findIndex(h => h === cand);
+          if (i !== -1) return i;
+        }
+        for (const cand of candidates) {
+          const i = headers.findIndex(h => h.includes(cand));
+          if (i !== -1) return i;
+        }
+        return -1;
+      };
+
+      // "1,234" / "₩1,234" / 숫자 → number (실패 시 null)
+      const toNumber = (val) => {
+        if (val === null || val === undefined || val === '') return null;
+        if (typeof val === 'number') return val;
+        const s = String(val).replace(/[,₩\s%]/g, '');
+        const n = parseFloat(s);
+        return isNaN(n) ? null : n;
+      };
+
+      // Excel 날짜 → 'YYYY-MM-DD' 문자열
+      const toDate = (val) => {
+        if (!val && val !== 0) return null;
+        if (val instanceof Date) {
+          if (isNaN(val)) return null;
+          return val.toISOString().slice(0, 10);
+        }
+        if (typeof val === 'string') {
+          const s = val.trim();
+          if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+          if (/^\d{4}[\/\.]\d{2}[\/\.]\d{2}/.test(s)) return s.replace(/[\/\.]/g, '-').slice(0, 10);
+          return s;
+        }
+        if (typeof val === 'number') {
+          const d = new Date((val - 25569) * 86400 * 1000);
+          if (!isNaN(d)) return d.toISOString().slice(0, 10);
+        }
+        return String(val);
+      };
+
+      // 핵심 필드 (매핑 점수 산정 기준) + 문자열 필드
+      const CORE_FIELDS    = ['campaign', 'date', 'impressions', 'clicks', 'cost', 'conversions', 'revenue'];
+      const STRING_FIELDS  = ['campaign', 'adType', 'adGroup', 'keyword'];
+
+      // 행 → 통합 스키마 객체
+      const normalizeRow = (row, headers, mapping) => {
+        const out = { campaign: null, adType: null, adGroup: null, keyword: null, date: null, impressions: null, clicks: null, cost: null, conversions: null, revenue: null };
+        for (const [field, candidates] of Object.entries(mapping)) {
+          const idx = findColumnIdx(headers, candidates);
+          if (idx === -1) continue;
+          const v = row[idx];
+          if (STRING_FIELDS.includes(field)) out[field] = v == null ? null : String(v).trim();
+          else if (field === 'date')         out[field] = toDate(v);
+          else                                out[field] = toNumber(v);
+        }
+        return out;
+      };
+
+      // 매핑 점수: 핵심 7개 필드 중 몇 개 매핑되었는지 (adGroup/keyword는 보너스라 카운트 제외)
+      const mappingScore = (headers, mapping) => {
+        let matched = 0;
+        for (const field of CORE_FIELDS) {
+          if (mapping[field] && findColumnIdx(headers, mapping[field]) !== -1) matched++;
+        }
+        return { matched, total: CORE_FIELDS.length };
+      };
+
+      // 천단위 콤마 포맷
+      const fmtNum = (v) => (v === null || v === undefined) ? '—' : Number(v).toLocaleString('ko-KR');
+
+      // 백분율 포맷 (소수 1자리)
+      const fmtPct = (v) => (v === null || v === undefined || !isFinite(v)) ? '—' : `${Number(v).toFixed(1)}%`;
+
+      // 원화 포맷 (반올림)
+      const fmtKRW = (v) => (v === null || v === undefined || !isFinite(v)) ? '—' : `${Math.round(Number(v)).toLocaleString('ko-KR')}원`;
+
+      // 행 배열을 keyName 기준으로 그룹핑 + 합계 + 파생 지표 계산
+      // ROAS = revenue/cost*100, CTR = clicks/impr*100, CPC = cost/clicks, CPA = cost/conv, CVR = conv/clicks*100
+      const aggregateGroup = (rows, keyName) => {
+        const map = new Map();
+        for (const r of rows) {
+          const k = r[keyName];
+          if (!k) continue;
+          if (!map.has(k)) map.set(k, {
+            key: k, count: 0,
+            adType: null,
+            impressions: 0, clicks: 0, cost: 0, conversions: 0, revenue: 0
+          });
+          const g = map.get(k);
+          g.count++;
+          if (!g.adType && r.adType) g.adType = r.adType;
+          g.impressions += Number(r.impressions) || 0;
+          g.clicks      += Number(r.clicks)      || 0;
+          g.cost        += Number(r.cost)        || 0;
+          g.conversions += Number(r.conversions) || 0;
+          g.revenue     += Number(r.revenue)     || 0;
+        }
+        return Array.from(map.values()).map(g => ({
+          ...g,
+          ctr:  g.impressions > 0 ? (g.clicks / g.impressions) * 100 : 0,
+          cpc:  g.clicks > 0 ? g.cost / g.clicks : 0,
+          cvr:  g.clicks > 0 ? (g.conversions / g.clicks) * 100 : 0,
+          cpa:  g.conversions > 0 ? g.cost / g.conversions : null,
+          roas: g.cost > 0 ? (g.revenue / g.cost) * 100 : 0,
+        }));
+      };
+
+      // ROAS 색상 클래스 (500% 이상 녹색, 200~500% 황색, 그 외 적색)
+      const roasColor = (roas) => roas >= 500 ? 'text-green-700' : roas >= 200 ? 'text-amber-700' : 'text-red-700';
+
+      // 광고타입 코드 → 한글 라벨 매핑 (네이버 API 영문 코드 / 엑셀 한글 라벨 모두 처리)
+      const AD_TYPE_LABELS = {
+        WEB_SITE:        '파워링크',
+        SHOPPING:        '쇼핑검색',
+        SHOPPING_BRAND:  '쇼핑브랜드',
+        BRAND_SEARCH:    '브랜드검색',
+        CATALOG:         '카탈로그',
+        POWER_CONTENTS:  '파워컨텐츠',
+        PLACE:           '플레이스',
+      };
+      const fmtAdType = (raw) => {
+        if (!raw) return '';
+        const k = String(raw).trim().toUpperCase();
+        return AD_TYPE_LABELS[k] || raw;  // 이미 한글이면 그대로, 영문 코드면 매핑
+      };
+
+      // 쇼핑 계열 광고타입 판별 (자동 키워드 + 제외키워드 방식으로 운영됨)
+      const isShoppingType = (raw) => {
+        if (!raw) return false;
+        const s = String(raw).trim().toUpperCase();
+        return s === 'SHOPPING' || s === 'SHOPPING_BRAND' || s === 'CATALOG' ||
+               /쇼핑|카탈로그/.test(raw);
+      };
+
+      // 캠페인명에서 PC/모바일 힌트 추출 (네이버는 사용자가 캠페인명에 표시하는 관습)
+      const inferDevice = (campaignName) => {
+        if (!campaignName) return null;
+        const s = String(campaignName);
+        if (/모바일|★M★|\bM[)\]_]|_M_|MOBILE/i.test(s)) return '모바일';
+        if (/★PC★|\bPC[)\]_]|_PC_|\(PC\)|PC광고/i.test(s)) return 'PC';
+        return null;
+      };
+
+      // 적용된 권장 액션의 효과 평가 (snapshot vs 현재 성과 비교)
+      // snapshot: 적용 당시의 metrics, current: 지금 분석의 metrics
+      const evaluateEffect = (snapshot, current, role) => {
+        if (!snapshot) return null;
+        const fmt = (n) => Number(n || 0).toLocaleString('ko-KR');
+        if (role === 'loser') {
+          // 매출 0 + 비용 발생 키워드를 정리(삭제/제외/일시중지)한 케이스
+          if ((current.cost || 0) === 0) {
+            return { msg: '✓ 비용 발생 멈춤 (정리 효과 ↑)', cls: 'text-green-700' };
+          }
+          if ((current.revenue || 0) > 0) {
+            return { msg: '! 매출 발생 시작 — 정리 권장이 잘못된 판단일 수 있음', cls: 'text-amber-700' };
+          }
+          const diff = (current.cost || 0) - (snapshot.cost || 0);
+          if (diff < -100) {
+            return { msg: `✓ 비용 ${fmt(-diff)}원 감소 (적용 효과)`, cls: 'text-green-700' };
+          }
+          if (diff > 100) {
+            return { msg: `✗ 비용 ${fmt(diff)}원 증가 — 효과 없음, 재검토 필요`, cls: 'text-red-700' };
+          }
+          return { msg: '효과 평가 중 (큰 변화 없음)', cls: 'text-neutral-500' };
+        }
+        if (role === 'winner') {
+          // 유지/입찰가↑ 권장 적용 후
+          const revDiff = (current.revenue || 0) - (snapshot.revenue || 0);
+          const roasDiff = (current.roas || 0) - (snapshot.roas || 0);
+          if (revDiff > 0 && roasDiff >= 0) {
+            return { msg: `✓ 매출 +${fmt(revDiff)}원 (ROAS ${Number(snapshot.roas).toFixed(0)}% → ${Number(current.roas).toFixed(0)}%)`, cls: 'text-green-700' };
+          }
+          if (revDiff < 0 || roasDiff < -50) {
+            return { msg: `✗ 매출/ROAS 악화 — 입찰가 ↑ 효과 의문`, cls: 'text-red-700' };
+          }
+          return { msg: '효과 평가 중', cls: 'text-neutral-500' };
+        }
+        // middle
+        const roasDiff = (current.roas || 0) - (snapshot.roas || 0);
+        if (Math.abs(roasDiff) < 10) return { msg: '효과 평가 중', cls: 'text-neutral-500' };
+        if (roasDiff > 0) return { msg: `✓ ROAS 개선 (+${Number(roasDiff).toFixed(0)}%p)`, cls: 'text-green-700' };
+        return { msg: `✗ ROAS 악화 (${Number(roasDiff).toFixed(0)}%p)`, cls: 'text-red-700' };
+      };
+
+      // 위치 + 역할(승자/패자/중간) + 섹션(internal/cross)에 따른 액션 문구
+      const recommendActionForPosition = (p, role, section = 'internal') => {
+        const shopping = isShoppingType(p.adType);
+        const device = inferDevice(p.campaign);
+        const dev = device ? ` [${device}]` : '';
+        if (role === 'winner') {
+          if (shopping) return `유지${dev} · 입찰가 ↑ 검토 (쇼핑검색은 PC/모바일 입찰가 별도 확인)`;
+          return `유지${dev} · 입찰가 ↑ 검토 (ROAS 우수)`;
+        }
+        if (role === 'loser') {  // 매출 0 + 비용 발생
+          if (section === 'internal') {
+            if (shopping) return `같은 영역 내 중복인데 매출 0${dev} → 광고그룹 통합 또는 "제외키워드" 추가 검토`;
+            return `같은 영역 내 중복인데 매출 0${dev} → 광고그룹 통합 또는 키워드 삭제 검토`;
+          } else {
+            if (shopping) return `이 채널에서 매출 0${dev} → 입찰가 ↓ 또는 "제외키워드" 추가 검토`;
+            return `이 채널에서 매출 0${dev} → 입찰가 ↓ 또는 일시중지 검토`;
+          }
+        }
+        // middle (매출 발생 중이지만 1위 아님)
+        if (section === 'internal') {
+          if (shopping) return `같은 영역 다른 광고그룹이 더 효율${dev} — 광고그룹 통합 검토`;
+          return `같은 영역 다른 광고그룹이 더 효율${dev} — 광고그룹 통합 또는 입찰가 조정`;
+        }
+        // cross middle (다른 채널, 매출 발생)
+        if (shopping) return `이 채널도 매출 발생${dev} — 입찰가/제외키워드 미세 조정`;
+        return `이 채널도 매출 발생${dev} — 입찰가 조정 검토`;
+      };
+
+      // 광고타입별 뱃지 색상 (시각 구분)
+      const adTypeBadgeCls = (raw) => {
+        const s = String(raw || '').trim().toUpperCase();
+        const k = (raw || '').toString();
+        if (s === 'SHOPPING' || k.includes('쇼핑검색'))         return 'bg-blue-100 border-blue-500 text-blue-800';
+        if (s === 'SHOPPING_BRAND' || k.includes('쇼핑브랜드'))   return 'bg-purple-100 border-purple-500 text-purple-800';
+        if (s === 'BRAND_SEARCH' || k.includes('브랜드검색'))     return 'bg-amber-100 border-amber-500 text-amber-800';
+        if (s === 'CATALOG' || k.includes('카탈로그'))           return 'bg-pink-100 border-pink-500 text-pink-800';
+        if (s === 'WEB_SITE' || k.includes('파워링크'))          return 'bg-neutral-100 border-neutral-500 text-neutral-800';
+        return 'bg-neutral-100 border-neutral-400 text-neutral-700';
+      };
+
+      // 광고 정비 권장: 같은 키워드의 여러 위치 탐지 + 분류
+      // 분류:
+      //   internalDups  — 같은 광고영역(adType + device)에 같은 키워드 2곳 이상 = 자기끼리 입찰 경쟁 (진짜 정리 후보)
+      //   crossChannel  — 다른 광고영역에 같은 키워드 분산 = 다채널 운영 (보완 관계, 정리 대상 아님)
+      const detectAdRecommendations = (normalized) => {
+        if (!normalized || !normalized.length) return { internalDups: [], crossChannel: [] };
+
+        // 키워드 → 위치(캠페인+광고그룹+adType) 단위 집계
+        const byKeyword = {};
+        for (const r of normalized) {
+          const kw = r.keyword;
+          if (!kw) continue;
+          const posKey = `${r.campaign || ''}::${r.adGroup || ''}::${r.adType || ''}`;
+          if (!byKeyword[kw]) byKeyword[kw] = {};
+          if (!byKeyword[kw][posKey]) {
+            byKeyword[kw][posKey] = {
+              campaign: r.campaign || '?',
+              adType:   r.adType   || '',
+              adGroup:  r.adGroup  || '?',
+              impressions: 0, clicks: 0, cost: 0, conversions: 0, revenue: 0,
+            };
+          }
+          const p = byKeyword[kw][posKey];
+          p.impressions += Number(r.impressions) || 0;
+          p.clicks      += Number(r.clicks)      || 0;
+          p.cost        += Number(r.cost)        || 0;
+          p.conversions += Number(r.conversions) || 0;
+          p.revenue     += Number(r.revenue)     || 0;
+        }
+
+        const internalDups = [];
+        const crossChannel = [];
+
+        for (const [kw, posMap] of Object.entries(byKeyword)) {
+          const positions = Object.values(posMap).map(p => ({
+            ...p,
+            device: inferDevice(p.campaign),
+            cpc:  p.clicks > 0 ? p.cost / p.clicks : 0,
+            roas: p.cost > 0 ? (p.revenue / p.cost) * 100 : 0,
+          }));
+          if (positions.length < 2) continue;
+          positions.sort((a, b) => b.revenue - a.revenue);
+
+          // 광고영역 키 = adType + device. 같은 영역에 2+ 있으면 진짜 중복.
+          const areaMap = {};
+          for (const p of positions) {
+            const area = `${String(p.adType || '').toUpperCase()}::${p.device || ''}`;
+            if (!areaMap[area]) areaMap[area] = [];
+            areaMap[area].push(p);
+          }
+          const hasInternalDup = Object.values(areaMap).some(a => a.length >= 2);
+
+          const totalRevenue = positions.reduce((s, p) => s + p.revenue, 0);
+          const totalCost    = positions.reduce((s, p) => s + p.cost, 0);
+
+          if (hasInternalDup) {
+            // 같은 영역에 묶인 그룹 표시용
+            const dupSets = Object.values(areaMap).filter(a => a.length >= 2);
+            internalDups.push({ keyword: kw, positions, totalRevenue, totalCost, dupSets });
+          } else {
+            crossChannel.push({ keyword: kw, positions, totalRevenue, totalCost });
+          }
+        }
+
+        internalDups.sort((a, b) => b.totalRevenue - a.totalRevenue);
+        crossChannel.sort((a, b) => b.totalRevenue - a.totalRevenue);
+        return {
+          internalDups:  internalDups.slice(0, 15),
+          crossChannel:  crossChannel.slice(0, 15),
+        };
+      };
+
+      // ───────── 스마트스토어 통계 8종 파일 헬퍼 ─────────
+      const SMARTSTORE_FILE_TYPES = {
+        product_performance:  { label: '상품성과',           order: 1 },
+        product_channel:      { label: '상품 × 마케팅채널',  order: 2 },
+        product_keyword:      { label: '상품 × 검색채널',    order: 3 },
+        product_demographics: { label: '상품 × 인구통계',    order: 4 },
+        product_region:       { label: '상품 × 지역',        order: 5 },
+        product_marriage:     { label: '상품 × 결혼상태',    order: 6 },
+        sales_performance:    { label: '판매성과 (시간대)',  order: 7 },
+        shipping:             { label: '배송통계',           order: 8 },
+      };
+
+      // 파일명으로 8종 타입 자동 감지
+      const detectSmartstoreType = (filename) => {
+        if (/상품성과/.test(filename))                              return 'product_performance';
+        if (/상품_마케팅채널|상품_마케팅_채널/.test(filename))       return 'product_channel';
+        if (/상품_검색채널|상품_검색_채널/.test(filename))            return 'product_keyword';
+        if (/상품_인구통계/.test(filename))                          return 'product_demographics';
+        if (/상품_지역/.test(filename))                              return 'product_region';
+        if (/결혼상태|고객프로파일/.test(filename))                   return 'product_marriage';
+        if (/판매성과/.test(filename))                               return 'sales_performance';
+        if (/배송통계/.test(filename))                               return 'shipping';
+        return null;
+      };
+
+      // 엑셀 → [{컬럼명: 값, ...}, ...] 객체 배열
+      const parseExcelDict = (file) => {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            try {
+              const data = new Uint8Array(e.target.result);
+              const wb = XLSX.read(data, { type: 'array', cellDates: true });
+              const sheetName = wb.SheetNames[0];
+              const sheet = wb.Sheets[sheetName];
+              const rows = XLSX.utils.sheet_to_json(sheet, { defval: null });
+              resolve({ sheetName, rows });
+            } catch (err) { reject(err); }
+          };
+          reader.onerror = () => reject(new Error('파일 읽기 실패'));
+          reader.readAsArrayBuffer(file);
+        });
+      };
+
+      // 베스트셀러 분석 (상품성과 파일 기반)
+      const analyzeBestsellers = (data) => {
+        if (!data || !data.rows || !data.rows.length) return null;
+        const rows = data.rows.slice().sort((a, b) =>
+          (b['결제금액'] || 0) - (a['결제금액'] || 0)
+        );
+        const totalRevenue = rows.reduce((s, r) => s + (r['결제금액'] || 0), 0);
+        const top15 = rows.slice(0, 15);
+        const top15Revenue = top15.reduce((s, r) => s + (r['결제금액'] || 0), 0);
+        return {
+          rows,
+          totalRevenue,
+          totalProducts: rows.length,
+          top15,
+          top15Share: totalRevenue > 0 ? (top15Revenue / totalRevenue) * 100 : 0,
+        };
+      };
+
+      // 카테고리 매출 비중 (상품성과 기반)
+      const analyzeCategoryShare = (data) => {
+        if (!data || !data.rows || !data.rows.length) return null;
+        const byCat = {};
+        let total = 0;
+        for (const r of data.rows) {
+          const cat = r['상품카테고리(소)'] || '미분류';
+          if (!byCat[cat]) byCat[cat] = { revenue: 0, count: 0 };
+          const rev = r['결제금액'] || 0;
+          byCat[cat].revenue += rev;
+          byCat[cat].count += 1;
+          total += rev;
+        }
+        return Object.entries(byCat)
+          .map(([cat, v]) => ({ category: cat, ...v, share: total > 0 ? v.revenue / total * 100 : 0 }))
+          .sort((a, b) => b.revenue - a.revenue);
+      };
+
+      // 채널 매출 분포 (광고 vs 자연 vs 직접 구분)
+      const analyzeChannels = (data) => {
+        if (!data || !data.rows || !data.rows.length) return null;
+        const byCh = {};
+        for (const r of data.rows) {
+          const ch = r['채널명'] || '(알수없음)';
+          if (!byCh[ch]) byCh[ch] = { revenue: 0, count: 0 };
+          byCh[ch].revenue += r['결제금액(과거 14일간 기여도추정)'] || 0;
+          byCh[ch].count   += r['결제수(과거 14일간 기여도추정)']   || 0;
+        }
+        const channels = Object.entries(byCh)
+          .map(([name, v]) => ({
+            name, ...v,
+            isAd:     /광고|ADVoost/.test(name),
+            isDirect: name === '(알수없음)',
+          }))
+          .sort((a, b) => b.revenue - a.revenue);
+        const total         = channels.reduce((s, c) => s + c.revenue, 0);
+        const adRevenue     = channels.filter(c => c.isAd).reduce((s, c) => s + c.revenue, 0);
+        const directRevenue = channels.filter(c => c.isDirect).reduce((s, c) => s + c.revenue, 0);
+        const naturalRevenue = total - adRevenue - directRevenue;
+        return { channels, total, adRevenue, naturalRevenue, directRevenue };
+      };
+
+      // 상품 정비 등급 분류 (유지 / 점검 / 정비 3등급)
+      // 매출 상위 30% + 환불 5%↓ = 유지, 환불 15%↑ = 점검, 매출 하위 30% = 정비
+      const classifyProducts = (productPerf) => {
+        if (!productPerf || !productPerf.rows || !productPerf.rows.length) return null;
+        const rows = productPerf.rows.slice().sort((a, b) =>
+          (b['결제금액'] || 0) - (a['결제금액'] || 0)
+        );
+        const n = rows.length;
+        const top30Idx = Math.floor(n * 0.3);
+        const bottom30Idx = Math.floor(n * 0.7);
+
+        const keep = [];     // 🟢 유지·강화
+        const review = [];   // 🟡 점검 (환불율 높음)
+        const cleanup = [];  // 🔴 정비 (저매출)
+
+        rows.forEach((p, i) => {
+          const rev = p['결제금액'] || 0;
+          const refundPct = (p['환불비율(결제금액)'] || 0) * 100;
+          const count = p['결제수'] || 0;
+
+          if (refundPct >= 15 && rev >= 50000) {
+            review.push({ ...p, _reason: `환불율 ${refundPct.toFixed(1)}%`, _refundPct: refundPct });
+          } else if (i < top30Idx && refundPct < 5 && count >= 5) {
+            keep.push({ ...p, _reason: '매출 상위 + 저환불 + 결제 다수' });
+          } else if (i >= bottom30Idx) {
+            cleanup.push({ ...p, _reason: '매출 하위' });
+          }
+        });
+
+        return {
+          keep:    keep.slice(0, 10),
+          review:  review.sort((a, b) => b._refundPct - a._refundPct).slice(0, 10),
+          cleanup: cleanup.slice(0, 10),
+          totalProducts: n,
+        };
+      };
+
+      // 인구통계 집계 (성별 × 연령) — 전체 또는 특정 상품 ID 기준
+      const aggregateDemographics = (data, productId = null) => {
+        if (!data || !data.rows || !data.rows.length) return null;
+        const matrix = {};
+        let total = 0;
+        for (const r of data.rows) {
+          if (productId && String(r['상품ID']) !== String(productId)) continue;
+          const gender = r['성별'] || '미상';
+          const age = r['나이'] || '미상';
+          const key = `${gender}|${age}`;
+          if (!matrix[key]) matrix[key] = { gender, age, revenue: 0, count: 0 };
+          matrix[key].revenue += r['결제금액'] || 0;
+          matrix[key].count   += r['결제수']   || 0;
+          total += r['결제금액'] || 0;
+        }
+        return {
+          cells: Object.values(matrix).map(m => ({ ...m, share: total > 0 ? m.revenue / total * 100 : 0 })),
+          total,
+        };
+      };
+
+      // 시간대별 매출 (판매성과 파일 기반)
+      const aggregateHourly = (data) => {
+        if (!data || !data.rows || !data.rows.length) return null;
+        const byHour = {};
+        let total = 0;
+        for (const r of data.rows) {
+          const h = r['시간대'];
+          if (!h) continue;
+          if (!byHour[h]) byHour[h] = { hour: h, revenue: 0, count: 0 };
+          byHour[h].revenue += r['결제금액'] || 0;
+          byHour[h].count   += r['결제수']   || 0;
+          total += r['결제금액'] || 0;
+        }
+        return {
+          hours: Object.values(byHour)
+            .map(h => ({ ...h, share: total > 0 ? h.revenue / total * 100 : 0 }))
+            .sort((a, b) => a.hour.localeCompare(b.hour)),
+          total,
+        };
+      };
+
+      // 광고 OFF 키워드 (자연 매출만 있고 광고 0인 키워드, 1만원 이상)
+      const findOrphanKeywords = (data, minNatural = 10000) => {
+        if (!data || !data.rows || !data.rows.length) return [];
+        const byKw = {};
+        for (const r of data.rows) {
+          const kw = r['키워드'] || '';
+          const ch = r['채널명'] || '';
+          const rev = r['결제금액(과거 14일간 기여도추정)'] || 0;
+          if (!kw) continue;
+          if (!byKw[kw]) byKw[kw] = { natural: 0, ad: 0 };
+          if (/광고|ADVoost/.test(ch)) byKw[kw].ad += rev;
+          else                          byKw[kw].natural += rev;
+        }
+        return Object.entries(byKw)
+          .map(([kw, v]) => ({ keyword: kw, ...v }))
+          .filter(k => k.natural >= minNatural && k.ad === 0)
+          .sort((a, b) => b.natural - a.natural);
+      };
+
+      // ───────── 메인 탭 정의 ─────────
+      const MAIN_TABS = [
+        ['excel',      '광고 분석 (엑셀)',  '1'],
+        ['smartstore', '스마트스토어 분석',  '2'],
+        ['screenshot', '스크린샷 AI 분석',  '3'],
+        ['report',     '광고 효율 리포트',  '4'],
+        ['compare',    '플랫폼 비교',        '5'],
+        ['history',    '분석 히스토리',      '6'],
+        ['settings',   '설정',              '12'],
+      ];
+
+      // ───────── 메인 앱 ─────────
+      function App() {
+        const [activeMainTab, setActiveMainTab] = useState('dashboard');
+
+        // 데이터 내보내기 (JSON 백업)
+        const handleExport = () => {
+          let settings = {}, history = [];
+          try { settings = JSON.parse(localStorage.getItem('adanalytics_settings') || '{}'); } catch {}
+          try { history  = JSON.parse(localStorage.getItem('adanalytics_history')  || '[]'); } catch {}
+          const allData = {
+            settings,
+            history,
+            exportDate: new Date().toISOString(),
+            appVersion: APP_VERSION,
+          };
+          const blob = new Blob([JSON.stringify(allData, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const filename = `광고분석_백업_${new Date().toISOString().split('T')[0]}.json`;
+          const link = document.createElement('a');
+          link.href = url; link.download = filename; link.click();
+          URL.revokeObjectURL(url);
+        };
+
+        // 데이터 가져오기 (JSON 복원)
+        const handleImport = (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            try {
+              const data = JSON.parse(ev.target.result);
+              if (data.settings) localStorage.setItem('adanalytics_settings', JSON.stringify(data.settings));
+              if (data.history)  localStorage.setItem('adanalytics_history',  JSON.stringify(data.history));
+              alert('가져오기 완료. 페이지를 새로고침합니다.');
+              location.reload();
+            } catch (err) {
+              alert('가져오기 실패: ' + err.message);
+            }
+          };
+          reader.readAsText(file);
+        };
+
+        return (
+          <div className="flex h-screen bg-neutral-50">
+            {/* ───────── 사이드바 ───────── */}
+            <aside className="w-56 bg-white border-r-2 border-black flex flex-col shrink-0">
+              {/* 로고 */}
+              <div className="px-4 py-4 border-b-2 border-black">
+                <div className="text-sm font-black text-black tracking-tight">광고분석</div>
+                <div className="text-[10px] font-bold text-neutral-500 tracking-widest">AD ANALYTICS</div>
+                <div className="text-[10px] text-neutral-400 mt-1 font-bold">{APP_VERSION}</div>
+              </div>
+
+              {/* 메뉴 */}
+              <nav className="flex-1 py-3 px-2 space-y-0.5 overflow-y-auto">
+                {/* 대시보드 */}
+                <button
+                  onClick={() => setActiveMainTab('dashboard')}
+                  className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-black tracking-tight transition-all text-left mb-2 ${
+                    activeMainTab === 'dashboard' ? 'bg-black text-white' : 'text-black hover:bg-neutral-100 border border-transparent hover:border-neutral-300'
+                  }`}
+                  style={{borderRadius:'2px'}}
+                >
+                  <span className={`text-[10px] font-black w-5 h-5 flex items-center justify-center shrink-0 ${activeMainTab === 'dashboard' ? 'bg-white text-black' : 'bg-black text-white'}`} style={{borderRadius:'2px'}}>홈</span>
+                  <span className="truncate">대시보드</span>
+                </button>
+                <div className="border-t border-neutral-200 my-2"></div>
+
+                {/* 1~12 탭 */}
+                {MAIN_TABS.map(([tab, label, num]) => {
+                  const isActive = activeMainTab === tab;
+                  return (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveMainTab(tab)}
+                      className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-black tracking-tight transition-all text-left ${
+                        isActive ? 'bg-black text-white' : 'text-black hover:bg-neutral-100 border border-transparent hover:border-neutral-300'
+                      }`}
+                      style={{borderRadius:'2px'}}
+                    >
+                      <span className={`text-[10px] font-black w-5 h-5 flex items-center justify-center shrink-0 ${isActive ? 'bg-white text-black' : 'bg-neutral-200 text-neutral-700'}`} style={{borderRadius:'2px'}}>{num}</span>
+                      <span className="truncate flex-1">{label}</span>
+                    </button>
+                  );
+                })}
+              </nav>
+
+              {/* 내보내기 / 가져오기 */}
+              <div className="px-2 py-3 border-t-2 border-black space-y-1">
+                <button
+                  onClick={handleExport}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[11px] font-black uppercase tracking-widest bg-white border-2 border-black text-black hover:bg-black hover:text-white transition-all"
+                  style={{borderRadius:'2px'}}
+                >
+                  <Download /> 내보내기
+                </button>
+                <label
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[11px] font-black uppercase tracking-widest bg-black border-2 border-black text-white hover:bg-white hover:text-black transition-all cursor-pointer"
+                  style={{borderRadius:'2px'}}
+                >
+                  <Upload /> 가져오기
+                  <input type="file" accept=".json" className="hidden" onChange={handleImport} />
+                </label>
+              </div>
+            </aside>
+
+            {/* ───────── 메인 콘텐츠 ───────── */}
+            <main className="flex-1 overflow-y-auto p-6">
+              {activeMainTab === 'dashboard'  && <DashboardTab />}
+              {activeMainTab === 'excel'      && <ExcelUploadTab />}
+              {activeMainTab === 'smartstore' && <SmartstoreTab />}
+              {activeMainTab === 'screenshot' && <PlaceholderTab title="스크린샷 AI 분석"  subtitle="3 · SCREENSHOT VISION"  desc="광고 관리자 화면 캡쳐 이미지를 업로드하면 Claude AI가 노출, 클릭, 비용, 매출 등 핵심 숫자를 자동으로 추출합니다." phase="Phase 3"/>}
+              {activeMainTab === 'report'     && <PlaceholderTab title="광고 효율 리포트"  subtitle="4 · METRICS REPORT"      desc="ROAS, CTR, CPC, CPM, 전환율 등 핵심 지표를 자동 계산하여 표와 차트로 보여줍니다." phase="Phase 4"/>}
+              {activeMainTab === 'compare'    && <PlaceholderTab title="플랫폼 비교"        subtitle="5 · PLATFORM COMPARE"    desc="네이버, 카카오, 인스타그램 등 플랫폼별 광고 효율을 한눈에 비교합니다. 광고비 vs 매출 차트 포함." phase="Phase 5"/>}
+              {activeMainTab === 'history'    && <HistoryTab />}
+              {activeMainTab === 'settings'   && <SettingsTab />}
+            </main>
+          </div>
+        );
+      }
+
+      // ───────── 대시보드 ─────────
+      const DashboardTab = () => (
+        <div>
+          <h1 className="text-2xl font-black text-black tracking-tight mb-1">대시보드</h1>
+          <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">DASHBOARD</p>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div className="bg-white border-2 border-black p-4" style={{borderRadius:'2px'}}>
+              <div className="text-[10px] font-black tracking-widest text-neutral-500 mb-1">TOTAL ROAS</div>
+              <div className="text-3xl font-black tracking-tight">—</div>
+              <div className="text-[10px] text-neutral-400 mt-1 font-bold">데이터 업로드 필요</div>
+            </div>
+            <div className="bg-white border-2 border-black p-4" style={{borderRadius:'2px'}}>
+              <div className="text-[10px] font-black tracking-widest text-neutral-500 mb-1">TOTAL SPEND</div>
+              <div className="text-3xl font-black tracking-tight">—</div>
+              <div className="text-[10px] text-neutral-400 mt-1 font-bold">데이터 업로드 필요</div>
+            </div>
+            <div className="bg-white border-2 border-black p-4" style={{borderRadius:'2px'}}>
+              <div className="text-[10px] font-black tracking-widest text-neutral-500 mb-1">TOTAL REVENUE</div>
+              <div className="text-3xl font-black tracking-tight">—</div>
+              <div className="text-[10px] text-neutral-400 mt-1 font-bold">데이터 업로드 필요</div>
+            </div>
+          </div>
+
+          <div className="bg-white border-2 border-black p-6" style={{borderRadius:'2px'}}>
+            <h2 className="text-sm font-black tracking-widest uppercase mb-3">시작하기</h2>
+            <ol className="text-xs text-neutral-700 space-y-2 list-decimal list-inside">
+              <li><b>설정</b> 탭에서 Anthropic API 키 등록 (스크린샷 분석용)</li>
+              <li><b>엑셀 업로드 분석</b> 또는 <b>스크린샷 AI 분석</b> 탭에서 데이터 입력</li>
+              <li><b>광고 효율 리포트</b>, <b>플랫폼 비교</b> 탭에서 결과 확인</li>
+            </ol>
+          </div>
+        </div>
+      );
+
+      // ───────── 플레이스홀더 (Phase 2~6용) ─────────
+      const PlaceholderTab = ({ title, subtitle, desc, phase }) => (
+        <div>
+          <h1 className="text-2xl font-black text-black tracking-tight mb-1">{title}</h1>
+          <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">{subtitle}</p>
+          <div className="bg-white border-2 border-black p-6 mb-4" style={{borderRadius:'2px'}}>
+            <p className="text-sm text-neutral-700 leading-relaxed">{desc}</p>
+          </div>
+          <div className="bg-neutral-100 border border-neutral-300 px-4 py-3 inline-block" style={{borderRadius:'2px'}}>
+            <span className="text-[11px] font-black tracking-widest uppercase text-neutral-600">{phase}에서 구현 예정</span>
+          </div>
+        </div>
+      );
+
+      // ───────── 엑셀 업로드 분석 (Phase 2) ─────────
+      const ExcelUploadTab = () => {
+        const [parsed, setParsed]   = useState(null);   // { filename, sheetName, headers, rows, detectedPlatform }
+        const [manualPlatform, setManualPlatform] = useState(null);
+        const [error, setError]     = useState('');
+        const [loading, setLoading] = useState(false);
+        const [savedMsg, setSavedMsg] = useState('');
+        const [expandedAdGroup, setExpandedAdGroup] = useState(null); // 드릴다운된 광고그룹 키
+        const [appliedActions, setAppliedActions] = useState(() => {
+          try { return JSON.parse(localStorage.getItem('adanalytics_applied_actions') || '{}'); }
+          catch { return {}; }
+        });
+        const fileInputRef = useRef(null);
+
+        // 액션 ID 생성 (키워드 + 위치 + 역할로 고유)
+        const getActionId = (keyword, p, role) =>
+          `${keyword}::${p.campaign || ''}::${p.adGroup || ''}::${String(p.adType || '').toUpperCase()}::${role}`;
+
+        // 적용 토글 (체크박스 클릭 시 호출)
+        const toggleApplied = (keyword, p, role, actionText) => {
+          const id = getActionId(keyword, p, role);
+          const next = { ...appliedActions };
+          if (next[id]) {
+            delete next[id];
+          } else {
+            next[id] = {
+              appliedAt: new Date().toISOString(),
+              keyword,
+              actionText,
+              role,
+              snapshot: {
+                cost: p.cost, clicks: p.clicks, revenue: p.revenue,
+                conversions: p.conversions, roas: p.roas, cpc: p.cpc,
+              },
+              path: { campaign: p.campaign, adGroup: p.adGroup, adType: p.adType, device: p.device },
+            };
+          }
+          setAppliedActions(next);
+          localStorage.setItem('adanalytics_applied_actions', JSON.stringify(next));
+        };
+
+        const handleFile = (file) => {
+          if (!file) return;
+          setError(''); setParsed(null); setManualPlatform(null); setSavedMsg('');
+          setLoading(true);
+
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            try {
+              const data = new Uint8Array(e.target.result);
+              const wb = XLSX.read(data, { type: 'array', cellDates: true });
+              const sheetName = wb.SheetNames[0];
+              const sheet = wb.Sheets[sheetName];
+              const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false, dateNF: 'yyyy-mm-dd' });
+              const headerRowIdx = findHeaderRowIdx(aoa);
+              const headers = (aoa[headerRowIdx] || []).map(h => String(h ?? '').trim());
+              const rows    = aoa.slice(headerRowIdx + 1).filter(r => r.some(c => c !== '' && c !== null));
+              setParsed({
+                filename: file.name,
+                sheetName,
+                headers,
+                rows,
+                detectedPlatform: detectPlatform(headers),
+              });
+            } catch (err) {
+              setError('엑셀 파싱 실패: ' + err.message);
+            }
+            setLoading(false);
+          };
+          reader.onerror = () => { setError('파일 읽기 실패'); setLoading(false); };
+          reader.readAsArrayBuffer(file);
+        };
+
+        const onDrop = (e) => {
+          e.preventDefault();
+          const f = e.dataTransfer.files[0];
+          if (f) handleFile(f);
+        };
+
+        const platformKey = manualPlatform || parsed?.detectedPlatform;
+        const platformDef = platformKey ? PLATFORM_PARSERS[platformKey] : null;
+        const normalized = parsed && platformDef
+          ? parsed.rows.map(r => normalizeRow(r, parsed.headers, platformDef.mapping))
+          : [];
+        const score = parsed && platformDef ? mappingScore(parsed.headers, platformDef.mapping) : null;
+
+        // 전체 합계 (정규화된 모든 행)
+        const totals = normalized.length ? normalized.reduce((a, r) => ({
+          impressions: a.impressions + (Number(r.impressions) || 0),
+          clicks:      a.clicks      + (Number(r.clicks)      || 0),
+          cost:        a.cost        + (Number(r.cost)        || 0),
+          conversions: a.conversions + (Number(r.conversions) || 0),
+          revenue:     a.revenue     + (Number(r.revenue)     || 0),
+        }), { impressions:0, clicks:0, cost:0, conversions:0, revenue:0 }) : null;
+        const nonZeroClickRows = normalized.filter(r => (Number(r.clicks) || 0) > 0).length;
+
+        // 광고그룹 / 키워드 단위 집계 + 효율 순위
+        const adGroupAgg = normalized.length ? aggregateGroup(normalized, 'adGroup') : [];
+        const keywordAgg = normalized.length ? aggregateGroup(normalized, 'keyword') : [];
+
+        // 광고그룹 전체 목록 (정비용 — 비용 0이어도 표시해서 쇼핑검색 등 모든 영역 분석 가능)
+        // 정렬: 비용 큰 순 → ROAS 좋은 순 (의미 있는 그룹 위로)
+        const allAdGroups = [...adGroupAgg]
+          .sort((a, b) => (b.cost - a.cost) || (b.roas - a.roas));
+
+        // 분석 기간: normalized rows의 date 컬럼에서 min/max 추출
+        const dateRange = (() => {
+          const dates = (normalized || [])
+            .map(r => r.date)
+            .filter(d => d && /^\d{4}-\d{2}-\d{2}/.test(d))
+            .sort();
+          if (!dates.length) return null;
+          const start = dates[0].slice(0, 10);
+          const end   = dates[dates.length - 1].slice(0, 10);
+          const days  = Math.round((new Date(end) - new Date(start)) / 86400000) + 1;
+          return { start, end, days };
+        })();
+
+        // 광고 정비 권장 (분류: internal=같은 영역 진짜 중복 / cross=다채널 운영)
+        const adRecommendations = detectAdRecommendations(normalized);
+
+        // 권장 카드 렌더링 (internal과 cross 양쪽에서 재사용)
+        const renderRecCard = (rec, i, section) => (
+          <div key={rec.keyword} className={`bg-white border-2 ${section === 'internal' ? 'border-red-300' : 'border-blue-300'} overflow-hidden`} style={{borderRadius:'2px'}}>
+            <div className="bg-neutral-100 border-b-2 border-neutral-700 px-3 py-2 flex items-center justify-between flex-wrap gap-2">
+              <div className="text-sm font-black tracking-tight">
+                <span className="text-[11px] text-neutral-500 mr-2">#{i+1}</span>
+                "{rec.keyword}"
+                <span className="text-[11px] font-bold text-neutral-500 ml-2">— {rec.positions.length}곳 등록됨</span>
+              </div>
+              <div className="text-[10px] font-mono">
+                <span className="text-neutral-500">총매출 </span>
+                <span className="font-black">{fmtKRW(rec.totalRevenue)}</span>
+              </div>
+            </div>
+
+            {/* 위치 테이블 (CPC 포함) */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="border-b border-neutral-300 bg-neutral-50">
+                    <th className="text-left  px-3 py-1.5 font-black tracking-widest uppercase w-24">상태</th>
+                    <th className="text-left  px-3 py-1.5 font-black tracking-widest uppercase">경로 (캠페인 → 광고그룹)</th>
+                    <th className="text-right px-3 py-1.5 font-black tracking-widest uppercase">비용</th>
+                    <th className="text-right px-3 py-1.5 font-black tracking-widest uppercase">CPC</th>
+                    <th className="text-right px-3 py-1.5 font-black tracking-widest uppercase">매출</th>
+                    <th className="text-right px-3 py-1.5 font-black tracking-widest uppercase">ROAS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rec.positions.map((p, j) => {
+                    const isWinner = j === 0 && p.revenue > 0;
+                    const isLoser  = p.revenue === 0;
+                    const rowBg    = isWinner ? 'bg-green-50' : isLoser ? 'bg-red-50' : '';
+                    const statusTxt = isWinner ? '잘 됨' : isLoser ? '매출 없음' : '보통';
+                    const statusCls = isWinner ? 'bg-green-700 text-white' : isLoser ? 'bg-red-700 text-white' : 'bg-amber-500 text-white';
+                    return (
+                      <tr key={j} className={`border-b border-neutral-200 ${rowBg}`}>
+                        <td className="px-3 py-1.5 whitespace-nowrap">
+                          <span className={`text-[9px] font-black tracking-widest uppercase px-1.5 py-0.5 ${statusCls}`} style={{borderRadius:'2px'}}>{statusTxt}</span>
+                        </td>
+                        <td className="px-3 py-1.5">
+                          <span className="text-neutral-600">{p.campaign}</span>
+                          <span className="text-neutral-400 mx-1.5">→</span>
+                          <span className="font-bold">{p.adGroup}</span>
+                          {p.adType && (
+                            <span className={`ml-2 inline-block border text-[9px] font-black tracking-widest px-1.5 py-0.5 ${adTypeBadgeCls(p.adType)}`} style={{borderRadius:'2px'}}>
+                              {fmtAdType(p.adType)}
+                            </span>
+                          )}
+                          {p.device && (
+                            <span className="ml-1 inline-block bg-neutral-700 text-white text-[9px] font-black tracking-widest px-1.5 py-0.5" style={{borderRadius:'2px'}}>
+                              {p.device}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(p.cost)}</td>
+                        <td className="px-3 py-1.5 text-right font-mono text-neutral-700">{p.clicks > 0 ? fmtKRW(p.cpc) : '—'}</td>
+                        <td className="px-3 py-1.5 text-right font-mono font-black">{fmtKRW(p.revenue)}</td>
+                        <td className={`px-3 py-1.5 text-right font-mono font-black ${p.revenue > 0 ? roasColor(p.roas) : 'text-neutral-400'}`}>
+                          {p.revenue > 0 ? fmtPct(p.roas) : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* 액션 권장 (체크박스 적용 + 효과 평가) */}
+            <div className="bg-neutral-50 border-t border-neutral-300 px-3 py-2">
+              <div className="text-[10px] font-black tracking-widest text-neutral-600 mb-1.5">
+                권장 액션 <span className="text-neutral-400 font-bold ml-1">(체크하면 적용 처리 + 다음 분석에서 효과 평가)</span>
+              </div>
+              <ul className="text-[11px] text-neutral-700 space-y-1.5">
+                {(() => {
+                  const winner = rec.positions[0];
+                  const losers = rec.positions.filter(p => p.revenue === 0);
+                  const others = rec.positions.slice(1).filter(p => p.revenue > 0);
+                  const tag = (p) => (
+                    <span className={`inline-block border text-[9px] font-black tracking-widest px-1 ${adTypeBadgeCls(p.adType)} ml-1`} style={{borderRadius:'2px'}}>
+                      {fmtAdType(p.adType) || '광고'}
+                    </span>
+                  );
+
+                  const renderItem = (p, role, key) => {
+                    const actionText = recommendActionForPosition(p, role, section);
+                    const id = getActionId(rec.keyword, p, role);
+                    const applied = appliedActions[id];
+                    const effect = applied ? evaluateEffect(applied.snapshot, p, role) : null;
+                    const baseTxt = role === 'winner' ? <><b>매출 1위 ({p.adGroup})</b>{tag(p)}: {actionText} <span className="text-neutral-500">— ROAS {fmtPct(p.roas)} · CPC {fmtKRW(p.cpc)}</span></>
+                                  : role === 'loser' ? <><b>{p.adGroup}</b>{tag(p)}: <span className="font-black">{actionText}</span> <span className="text-neutral-500">— 비용 {fmtKRW(p.cost)}</span></>
+                                                     : <><b>{p.adGroup}</b>{tag(p)}: {actionText} <span className="text-neutral-500">— ROAS {fmtPct(p.roas)} · CPC {fmtKRW(p.cpc)}</span></>;
+                    const lineCls = applied ? 'line-through text-neutral-400' : (role === 'loser' ? 'text-red-700' : '');
+                    return (
+                      <li key={key} className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          checked={!!applied}
+                          onChange={() => toggleApplied(rec.keyword, p, role, actionText)}
+                          className="mt-1 shrink-0 cursor-pointer w-3.5 h-3.5 accent-black"
+                        />
+                        <div className="flex-1 leading-relaxed">
+                          <div className={lineCls}>{baseTxt}</div>
+                          {applied && (
+                            <div className="text-[10px] mt-1 flex items-center gap-2 flex-wrap">
+                              <span className="bg-green-700 text-white px-1.5 py-0.5 font-black tracking-widest uppercase" style={{borderRadius:'2px'}}>적용됨</span>
+                              <span className="text-neutral-500 font-mono">{new Date(applied.appliedAt).toLocaleString('ko-KR', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</span>
+                              {effect && <span className={`font-black ${effect.cls}`}>{effect.msg}</span>}
+                            </div>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  };
+
+                  return (
+                    <>
+                      {winner.revenue > 0 && renderItem(winner, 'winner', 'w')}
+                      {others.map((p, k) => renderItem(p, 'middle', `o${k}`))}
+                      {losers.map((p, k) => renderItem(p, 'loser', `l${k}`))}
+                    </>
+                  );
+                })()}
+              </ul>
+            </div>
+          </div>
+        );
+        const topKeywords = [...keywordAgg]
+          .filter(g => g.conversions > 0)
+          .sort((a, b) => b.roas - a.roas)
+          .slice(0, 10);
+        const wasteKeywords = [...keywordAgg]
+          .filter(g => g.cost >= 10000 && g.conversions === 0)
+          .sort((a, b) => b.cost - a.cost)
+          .slice(0, 5);
+
+        // 전체 합계의 파생 지표
+        const overallROAS = totals && totals.cost > 0 ? (totals.revenue / totals.cost) * 100 : 0;
+        const overallCTR  = totals && totals.impressions > 0 ? (totals.clicks / totals.impressions) * 100 : 0;
+        const overallCPC  = totals && totals.clicks > 0 ? totals.cost / totals.clicks : 0;
+        const overallCPA  = totals && totals.conversions > 0 ? totals.cost / totals.conversions : null;
+
+        const saveToHistory = () => {
+          if (!parsed || !normalized.length) return;
+          let history = [];
+          try { history = JSON.parse(localStorage.getItem('adanalytics_history') || '[]'); } catch {}
+          history.unshift({
+            id: Date.now(),
+            filename: parsed.filename,
+            platform: platformKey,
+            uploadedAt: new Date().toISOString(),
+            rowCount: normalized.length,
+            rows: normalized,
+          });
+          localStorage.setItem('adanalytics_history', JSON.stringify(history));
+          setSavedMsg(`히스토리에 저장됨 (${normalized.length}행)`);
+          setTimeout(() => setSavedMsg(''), 3000);
+        };
+
+        return (
+          <div>
+            <h1 className="text-2xl font-black text-black tracking-tight mb-1">엑셀 업로드 분석</h1>
+            <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">1 · EXCEL UPLOAD</p>
+
+            {/* ─── 매일 사용법 안내 ─── */}
+            <div className="bg-blue-50 border-2 border-blue-700 mb-4" style={{borderRadius:'2px'}}>
+              <div className="bg-blue-700 text-white px-3 py-2 flex items-center justify-between">
+                <div className="text-[11px] font-black tracking-widest uppercase">매일 사용법 · 네이버 광고 API 동기화</div>
+                <span className="text-[10px] font-bold opacity-80">3단계로 자동화</span>
+              </div>
+              <div className="px-4 py-3 space-y-3">
+                {/* 1단계 */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-blue-900 mb-1">1단계 — 터미널에서 동기화 실행 (한 줄, 약 1~2분)</div>
+                  <div className="bg-black text-white p-2 font-mono text-[11px] flex items-center justify-between gap-2" style={{borderRadius:'2px'}}>
+                    <code className="break-all">python tools/fetch_naver_ads.py --days 12 --ad-report</code>
+                    <button
+                      onClick={() => { try { navigator.clipboard.writeText('python tools/fetch_naver_ads.py --days 12 --ad-report'); } catch {} }}
+                      className="text-[9px] font-black uppercase tracking-widest px-2 py-1 bg-white text-black hover:bg-neutral-200 whitespace-nowrap"
+                      style={{borderRadius:'2px'}}
+                    >
+                      복사
+                    </button>
+                  </div>
+                  <div className="text-[10px] text-neutral-600 mt-1 font-bold">
+                    캠페인 / 광고그룹 / 키워드 / 디바이스 분리 통계 모두 자동 수신 → samples/ 폴더에 CSV 저장
+                  </div>
+                </div>
+
+                {/* 2단계 */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-blue-900 mb-1">2단계 — 생성된 CSV를 아래 드롭존에 드래그</div>
+                  <div className="bg-white border border-neutral-400 p-2 font-mono text-[11px]" style={{borderRadius:'2px'}}>
+                    samples/naver_api_export_YYYYMMDD.csv
+                  </div>
+                  <div className="text-[10px] text-neutral-600 mt-1 font-bold">
+                    파일 자동 인식 → 분석 결과 / 광고그룹 효율 / 정비 권장 사항 자동 출력
+                  </div>
+                </div>
+
+                {/* 3단계 (선택) */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-blue-900 mb-1">3단계 (선택) — 쇼핑검색 검색어 분석</div>
+                  <ol className="text-[11px] text-neutral-700 font-bold space-y-0.5 ml-3">
+                    <li>① <a href="https://searchad.naver.com/" target="_blank" rel="noopener noreferrer" className="underline">searchad.naver.com</a> → 보고서 → 검색어 보고서</li>
+                    <li>② 기간 선택 → 다운로드 (.xlsx)</li>
+                    <li>③ 본 탭 드롭존에 드래그 → 검색어별 분석 자동 적용</li>
+                  </ol>
+                </div>
+
+                {/* 초기 설정 안내 */}
+                <div className="bg-amber-50 border border-amber-600 px-2 py-1.5 text-[10px] font-bold text-amber-900" style={{borderRadius:'2px'}}>
+                  <b>처음 사용 시:</b> 프로젝트 루트의 <code className="bg-white px-1">naver_credentials.template.json</code> → <code className="bg-white px-1">naver_credentials.json</code> 복사 후 액세스라이선스/비밀키 입력 (`.gitignore`로 보호됨)
+                </div>
+              </div>
+            </div>
+
+            {/* 드롭존 */}
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={onDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className="bg-white border-2 border-dashed border-black p-10 text-center cursor-pointer hover:bg-neutral-50 transition-all mb-4"
+              style={{borderRadius:'2px'}}
+            >
+              <div className="text-sm font-black tracking-widest uppercase text-black mb-1">
+                엑셀 파일을 드래그하거나 클릭
+              </div>
+              <div className="text-[11px] text-neutral-500 font-bold">
+                .xlsx / .xls / .csv 지원 · 네이버 / 카카오 / 메타 자동 감지
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                className="hidden"
+                onChange={(e) => handleFile(e.target.files[0])}
+              />
+            </div>
+
+            {loading && (
+              <div className="bg-neutral-100 border border-neutral-300 px-4 py-3 mb-4" style={{borderRadius:'2px'}}>
+                <span className="text-[11px] font-black tracking-widest uppercase">분석 중...</span>
+              </div>
+            )}
+
+            {error && (
+              <div className="bg-red-50 border-2 border-red-600 p-4 mb-4" style={{borderRadius:'2px'}}>
+                <span className="text-xs font-black text-red-700">{error}</span>
+              </div>
+            )}
+
+            {parsed && (
+              <>
+                {/* 파일 / 플랫폼 정보 */}
+                <div className="bg-white border-2 border-black p-4 mb-4" style={{borderRadius:'2px'}}>
+                  <div className="flex items-center flex-wrap gap-2 mb-3">
+                    <span className="text-[10px] font-black tracking-widest text-neutral-500">파일</span>
+                    <span className="text-xs font-black">{parsed.filename}</span>
+                    <span className="text-[10px] text-neutral-400 font-bold">· 시트: {parsed.sheetName}</span>
+                    <span className="text-[10px] text-neutral-400 font-bold">· {parsed.rows.length}행</span>
+                  </div>
+                  {dateRange && (
+                    <div className="flex items-center flex-wrap gap-2 mb-3">
+                      <span className="text-[10px] font-black tracking-widest text-neutral-500">분석 기간</span>
+                      <span className="bg-neutral-100 border-2 border-black px-2 py-0.5 text-[11px] font-black font-mono" style={{borderRadius:'2px'}}>
+                        {dateRange.start} ~ {dateRange.end}
+                      </span>
+                      <span className="text-[10px] text-neutral-500 font-bold">({dateRange.days}일)</span>
+                    </div>
+                  )}
+                  <div className="flex items-center flex-wrap gap-2">
+                    <span className="text-[10px] font-black tracking-widest text-neutral-500">플랫폼</span>
+                    {parsed.detectedPlatform ? (
+                      <span className="bg-black text-white text-[10px] font-black px-2 py-0.5 tracking-widest uppercase" style={{borderRadius:'2px'}}>
+                        자동 감지: {PLATFORM_PARSERS[parsed.detectedPlatform].name}
+                      </span>
+                    ) : (
+                      <>
+                        <span className="bg-red-600 text-white text-[10px] font-black px-2 py-0.5 tracking-widest uppercase" style={{borderRadius:'2px'}}>
+                          감지 실패
+                        </span>
+                        <span className="text-[10px] text-neutral-500 font-bold">→ 수동 선택</span>
+                      </>
+                    )}
+                    {score && (
+                      <span className={`text-[10px] font-black px-2 py-0.5 tracking-widest uppercase ${
+                        score.matched === score.total ? 'bg-green-700 text-white' : 'bg-amber-500 text-white'
+                      }`} style={{borderRadius:'2px'}}>
+                        매핑 {score.matched}/{score.total}
+                      </span>
+                    )}
+                  </div>
+                  {/* 수동 플랫폼 선택 */}
+                  <div className="flex gap-1 mt-3">
+                    {Object.entries(PLATFORM_PARSERS).map(([key, p]) => {
+                      const active = (manualPlatform || parsed.detectedPlatform) === key;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => setManualPlatform(key)}
+                          className={`text-[10px] font-black tracking-widest uppercase px-3 py-1 transition-all ${
+                            active
+                              ? 'bg-black text-white'
+                              : 'bg-white border-2 border-black text-black hover:bg-neutral-100'
+                          }`}
+                          style={{borderRadius:'2px'}}
+                        >
+                          {p.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* ───────── 분석 결과 (인사이트 중심) ───────── */}
+                {platformKey && normalized.length > 0 && totals && (
+                  <>
+                    {/* 1. 분석 결과 요약 ─ 전체 합계 5개 + 효율 지표 4개 */}
+                    <div className="text-sm font-black tracking-widest uppercase text-black mb-1">분석 결과 요약</div>
+                    <div className="text-[11px] text-neutral-500 mb-3 font-bold">
+                      전체 {normalized.length.toLocaleString('ko-KR')}행 분석 · 클릭 발생 {nonZeroClickRows.toLocaleString('ko-KR')}행
+                    </div>
+
+                    {/* 합계 5개 카드 */}
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mb-2">
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">노출수</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtNum(totals.impressions)}</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">클릭수</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtNum(totals.clicks)}</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">광고비</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(totals.cost)}</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">전환수</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtNum(totals.conversions)}</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">매출</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(totals.revenue)}</div>
+                      </div>
+                    </div>
+
+                    {/* 효율 지표 4개 (의미 설명 포함) */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-6">
+                      <div className="bg-black text-white p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-300">광고 수익률 (ROAS)</div>
+                        <div className={`text-lg font-black tracking-tight mt-1 ${overallROAS >= 200 ? 'text-green-300' : 'text-red-300'}`}>{fmtPct(overallROAS)}</div>
+                        <div className="text-[9px] text-neutral-400 font-bold mt-1">광고비 1원당 매출</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">클릭률 (CTR)</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtPct(overallCTR)}</div>
+                        <div className="text-[9px] text-neutral-400 font-bold mt-1">노출 대비 클릭 비율</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">클릭당 비용 (CPC)</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(overallCPC)}</div>
+                        <div className="text-[9px] text-neutral-400 font-bold mt-1">클릭 한 번에 든 비용</div>
+                      </div>
+                      <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                        <div className="text-[10px] font-black tracking-widest text-neutral-500">전환당 비용 (CPA)</div>
+                        <div className="text-lg font-black tracking-tight mt-1">{overallCPA != null ? fmtKRW(overallCPA) : '—'}</div>
+                        <div className="text-[9px] text-neutral-400 font-bold mt-1">전환 1건당 광고비</div>
+                      </div>
+                    </div>
+
+                    {/* 2. 광고그룹 효율 분석 (전체 ─ 정비용) */}
+                    {allAdGroups.length > 0 && (
+                      <div className="mb-6">
+                        <div className="text-sm font-black tracking-widest uppercase text-black mb-1">
+                          광고그룹 효율 분석 · 전체 {allAdGroups.length}개
+                        </div>
+                        <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                          비용 큰 순 → ROAS 좋은 순 정렬. 비용 0인 그룹도 포함 (쇼핑검색 등 모든 영역 표시). <span className="text-black">행 클릭 시 키워드 상세 분석</span>
+                        </div>
+                        <div className="bg-white border-2 border-black overflow-auto" style={{borderRadius:'2px', maxHeight:'520px'}}>
+                          <table className="w-full text-[11px]">
+                            <thead>
+                              <tr className="border-b-2 border-black">
+                                <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest w-10 border-b-2 border-black">#</th>
+                                <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">광고타입</th>
+                                <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">광고그룹</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">광고비</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">매출</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">ROAS</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">노출</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">클릭</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">CTR</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">CPC</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">전환</th>
+                                <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">CPA</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {allAdGroups.map((g, i) => {
+                                const isExpanded = expandedAdGroup === g.key;
+                                return (
+                                  <React.Fragment key={g.key}>
+                                    <tr
+                                      onClick={() => setExpandedAdGroup(isExpanded ? null : g.key)}
+                                      className={`border-b border-neutral-200 cursor-pointer hover:bg-neutral-100 transition-colors ${g.conversions === 0 ? 'bg-red-50 hover:bg-red-100' : ''} ${isExpanded ? '!bg-neutral-200' : ''}`}
+                                    >
+                                      <td className="px-2 py-1.5 font-black text-neutral-500 whitespace-nowrap">
+                                        <span className="inline-block w-3 text-[9px] text-black">{isExpanded ? '▼' : '▶'}</span> {i+1}
+                                      </td>
+                                      <td className="px-2 py-1.5 whitespace-nowrap">
+                                        {g.adType
+                                          ? <span className={`border px-1.5 py-0.5 text-[10px] font-black tracking-widest ${adTypeBadgeCls(g.adType)}`} style={{borderRadius:'2px'}}>{fmtAdType(g.adType)}</span>
+                                          : <span className="text-neutral-300">—</span>}
+                                      </td>
+                                      <td className="px-2 py-1.5 truncate max-w-[200px] font-bold" title={g.key}>{g.key}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(g.cost)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(g.revenue)}</td>
+                                      <td className={`px-2 py-1.5 text-right font-mono font-black ${roasColor(g.roas)}`}>{fmtPct(g.roas)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.impressions)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.clicks)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtPct(g.ctr)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{g.clicks > 0 ? fmtKRW(g.cpc) : '—'}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.conversions)}</td>
+                                      <td className="px-2 py-1.5 text-right font-mono">{g.cpa != null ? fmtKRW(g.cpa) : '—'}</td>
+                                    </tr>
+                                    {isExpanded && (() => {
+                                      // 동명 광고그룹이 광고타입별로 분리되도록 adType도 매칭 (둘 다 null이면 통과)
+                                      const keywords = aggregateGroup(
+                                        normalized.filter(r => r.adGroup === g.key && (!g.adType || r.adType === g.adType)),
+                                        'keyword'
+                                      ).filter(k => k.cost > 0).sort((a, b) => b.roas - a.roas);
+                                      return (
+                                        <tr>
+                                          <td colSpan={12} className="bg-neutral-50 px-4 py-3 border-b-2 border-neutral-400">
+                                            <div className="text-[11px] font-black tracking-widest text-neutral-700 mb-2 flex items-center gap-1.5 flex-wrap">
+                                              <span>↳</span>
+                                              {g.adType && (
+                                                <span className={`border px-1.5 py-0.5 text-[10px] font-black tracking-widest ${adTypeBadgeCls(g.adType)}`} style={{borderRadius:'2px'}}>
+                                                  {fmtAdType(g.adType)}
+                                                </span>
+                                              )}
+                                              <span>"{g.key}" 광고그룹의 키워드별 분석 · {keywords.length}개 (광고비 발생 키워드)</span>
+                                            </div>
+                                            {keywords.length === 0 ? (
+                                              <div className="text-[11px] text-neutral-400 font-bold py-2 px-2">광고비 발생 키워드 없음</div>
+                                            ) : (
+                                              <div className="bg-white border border-neutral-400 overflow-auto" style={{borderRadius:'2px', maxHeight:'400px'}}>
+                                                <table className="w-full text-[11px]">
+                                                  <thead>
+                                                    <tr className="border-b border-neutral-400">
+                                                      <th className="sticky top-0 bg-neutral-100 text-left  px-2 py-1.5 font-black uppercase tracking-widest w-8 border-b border-neutral-400">#</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-left  px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">키워드</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">광고비</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">매출</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">ROAS</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">노출</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">클릭</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">CTR</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">CPC</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">전환</th>
+                                                      <th className="sticky top-0 bg-neutral-100 text-right px-2 py-1.5 font-black uppercase tracking-widest border-b border-neutral-400">CPA</th>
+                                                    </tr>
+                                                  </thead>
+                                                  <tbody>
+                                                    {keywords.map((k, j) => (
+                                                      <tr key={k.key} className={`border-b border-neutral-100 ${k.conversions === 0 ? 'bg-red-50' : ''}`}>
+                                                        <td className="px-2 py-1.5 text-neutral-400">{j+1}</td>
+                                                        <td className="px-2 py-1.5 truncate max-w-[180px]" title={k.key}>{k.key}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(k.cost)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(k.revenue)}</td>
+                                                        <td className={`px-2 py-1.5 text-right font-mono font-black ${roasColor(k.roas)}`}>{fmtPct(k.roas)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtNum(k.impressions)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtNum(k.clicks)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtPct(k.ctr)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{k.clicks > 0 ? fmtKRW(k.cpc) : '—'}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{fmtNum(k.conversions)}</td>
+                                                        <td className="px-2 py-1.5 text-right font-mono">{k.cpa != null ? fmtKRW(k.cpa) : '—'}</td>
+                                                      </tr>
+                                                    ))}
+                                                  </tbody>
+                                                </table>
+                                              </div>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })()}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 3. 최고 효율 키워드 TOP 10 */}
+                    {topKeywords.length > 0 && (
+                      <div className="mb-6">
+                        <div className="text-sm font-black tracking-widest uppercase text-black mb-1">
+                          최고 효율 키워드 TOP {topKeywords.length}
+                        </div>
+                        <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                          전환 1건 이상 + ROAS 높은 순. 입찰가 올려서 노출 늘릴 후보
+                        </div>
+                        <div className="bg-white border-2 border-black overflow-x-auto" style={{borderRadius:'2px'}}>
+                          <table className="w-full text-[11px]">
+                            <thead>
+                              <tr className="border-b-2 border-black bg-neutral-50">
+                                <th className="text-left  px-2 py-2 font-black uppercase tracking-widest w-10">#</th>
+                                <th className="text-left  px-2 py-2 font-black uppercase tracking-widest">키워드</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">광고비</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">매출</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">ROAS</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">클릭</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">전환</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">CPA</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {topKeywords.map((g, i) => (
+                                <tr key={g.key} className="border-b border-neutral-200">
+                                  <td className="px-2 py-1.5 font-black">{i+1}</td>
+                                  <td className="px-2 py-1.5 truncate max-w-[200px]" title={g.key}>{g.key}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(g.cost)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtKRW(g.revenue)}</td>
+                                  <td className={`px-2 py-1.5 text-right font-mono font-black ${roasColor(g.roas)}`}>{fmtPct(g.roas)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.clicks)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.conversions)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{g.cpa != null ? fmtKRW(g.cpa) : '—'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 4. 광고비 낭비 키워드 (조건부 표시) */}
+                    {wasteKeywords.length > 0 && (
+                      <div className="mb-6">
+                        <div className="text-sm font-black tracking-widest uppercase text-red-700 mb-1">
+                          광고비 낭비 키워드 TOP {wasteKeywords.length}
+                        </div>
+                        <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                          광고비 1만원 이상 썼는데 전환 0건. 입찰가 조정 / 일시중지 검토 대상
+                        </div>
+                        <div className="bg-red-50 border-2 border-red-600 overflow-x-auto" style={{borderRadius:'2px'}}>
+                          <table className="w-full text-[11px]">
+                            <thead>
+                              <tr className="border-b-2 border-red-600 bg-red-100">
+                                <th className="text-left  px-2 py-2 font-black uppercase tracking-widest w-10">#</th>
+                                <th className="text-left  px-2 py-2 font-black uppercase tracking-widest">키워드</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">광고비</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">클릭</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">노출</th>
+                                <th className="text-right px-2 py-2 font-black uppercase tracking-widest">전환</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {wasteKeywords.map((g, i) => (
+                                <tr key={g.key} className="border-b border-red-200">
+                                  <td className="px-2 py-1.5 font-black">{i+1}</td>
+                                  <td className="px-2 py-1.5 truncate max-w-[200px]" title={g.key}>{g.key}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono font-black text-red-700">{fmtKRW(g.cost)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.clicks)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">{fmtNum(g.impressions)}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono">0</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ─── 광고 정비 권장 사항 (분류: 진짜 중복 vs 다채널 운영) ─── */}
+                    {(adRecommendations.internalDups.length > 0 || adRecommendations.crossChannel.length > 0) && (
+                      <div className="mb-6">
+                        <div className="text-sm font-black tracking-widest uppercase mb-1">광고 정비 권장 사항</div>
+                        <div className="text-[11px] text-neutral-500 mb-3 font-bold">
+                          같은 키워드의 여러 위치 자동 탐지 → 진짜 중복 vs 다채널 운영으로 분류
+                        </div>
+                        <div className="bg-neutral-50 border border-neutral-300 px-3 py-2 mb-4 text-[10px] font-bold leading-relaxed text-neutral-700" style={{borderRadius:'2px'}}>
+                          <span className="text-black">분류 기준 + 광고타입별 운영 방식:</span><br/>
+                          • <span className="text-red-700 font-black">진짜 중복</span>: 같은 광고 영역(타입+디바이스)에 같은 키워드 2곳 이상 → 자기끼리 입찰 경쟁 → <b>정리 검토</b><br/>
+                          • <span className="text-blue-700 font-black">다채널 운영</span>: 다른 영역에 분산 (파워링크↔쇼핑 / PC↔모바일) → 보완 관계 → <b>채널별 효율 비교</b><br/>
+                          • <span className="text-neutral-800 font-black">파워링크</span>: 키워드 직접 삭제 / <span className="text-blue-700 font-black">쇼핑검색·브랜드·카탈로그</span>: 자동 매칭 → "제외키워드" 추가
+                        </div>
+
+                        {/* ① 진짜 중복 */}
+                        {adRecommendations.internalDups.length > 0 && (
+                          <>
+                            <div className="bg-red-100 border-2 border-red-700 px-3 py-2 mb-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[11px] font-black tracking-widest uppercase text-red-700">
+                                ① 진짜 중복 — 정리 검토 ({adRecommendations.internalDups.length}건)
+                              </div>
+                              <div className="text-[10px] text-red-900 font-bold mt-0.5">
+                                같은 광고 영역에 같은 키워드 2곳 이상 = 자기끼리 입찰 경쟁 (비효율)
+                              </div>
+                            </div>
+                            <div className="space-y-3 mb-5">
+                              {adRecommendations.internalDups.map((rec, i) => renderRecCard(rec, i, 'internal'))}
+                            </div>
+                          </>
+                        )}
+
+                        {/* ② 다채널 운영 */}
+                        {adRecommendations.crossChannel.length > 0 && (
+                          <>
+                            <div className="bg-blue-100 border-2 border-blue-700 px-3 py-2 mb-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[11px] font-black tracking-widest uppercase text-blue-700">
+                                ② 다채널 운영 비교 — 참고 ({adRecommendations.crossChannel.length}건)
+                              </div>
+                              <div className="text-[10px] text-blue-900 font-bold mt-0.5">
+                                다른 영역에 같은 키워드 분산 = 보완 관계 (정리 대상 아님). 비효율 채널은 입찰 조정 검토
+                              </div>
+                            </div>
+                            <div className="space-y-3">
+                              {adRecommendations.crossChannel.map((rec, i) => renderRecCard(rec, i, 'cross'))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 5. 저장 */}
+                    <div className="flex items-center gap-3 mt-4">
+                      <button
+                        onClick={saveToHistory}
+                        className="px-4 py-2 bg-black text-white text-[11px] font-black tracking-widest uppercase hover:bg-neutral-800 transition-all"
+                        style={{borderRadius:'2px'}}
+                      >
+                        히스토리에 저장
+                      </button>
+                      {savedMsg && (
+                        <span className="text-[11px] font-black text-green-700 tracking-widest uppercase">{savedMsg}</span>
+                      )}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+
+            {/* 원본 컬럼 디버그 (감지 실패 시 도움) */}
+            {parsed && !platformKey && (
+              <div className="bg-neutral-100 border border-neutral-300 p-3 mt-2" style={{borderRadius:'2px'}}>
+                <div className="text-[10px] font-black tracking-widest text-neutral-600 mb-1">감지된 헤더 컬럼</div>
+                <div className="text-[11px] font-mono text-neutral-700 break-all">
+                  {parsed.headers.filter(h => h).join(' | ')}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // ───────── 상품 드릴다운 (베스트셀러 행 클릭 시 펼쳐지는 상세) ─────────
+      const ProductDrilldown = ({ productId, files }) => {
+        const pidStr = String(productId);
+
+        // 채널 기여 TOP 10
+        const channels = useMemo(() => {
+          if (!files.product_channel) return [];
+          const map = {};
+          for (const r of files.product_channel.rows) {
+            if (String(r['상품ID']) !== pidStr) continue;
+            const ch = r['채널명'] || '(알수없음)';
+            if (!map[ch]) map[ch] = { name: ch, revenue: 0 };
+            map[ch].revenue += r['결제금액(과거 14일간 기여도추정)'] || 0;
+          }
+          const list = Object.values(map).sort((a, b) => b.revenue - a.revenue);
+          const total = list.reduce((s, c) => s + c.revenue, 0);
+          return list.slice(0, 10).map(c => ({ ...c, share: total > 0 ? c.revenue / total * 100 : 0 }));
+        }, [files.product_channel, pidStr]);
+
+        // 키워드 TOP 10
+        const keywords = useMemo(() => {
+          if (!files.product_keyword) return [];
+          const map = {};
+          for (const r of files.product_keyword.rows) {
+            if (String(r['상품ID']) !== pidStr) continue;
+            const kw = r['키워드'] || ''; const ch = r['채널명'] || '';
+            if (!kw) continue;
+            if (!map[kw]) map[kw] = { keyword: kw, natural: 0, ad: 0 };
+            const rev = r['결제금액(과거 14일간 기여도추정)'] || 0;
+            if (/광고|ADVoost/.test(ch)) map[kw].ad += rev;
+            else                          map[kw].natural += rev;
+          }
+          return Object.values(map).sort((a, b) => (b.natural + b.ad) - (a.natural + a.ad)).slice(0, 10);
+        }, [files.product_keyword, pidStr]);
+
+        // 인구통계 TOP 8
+        const demos = useMemo(() => {
+          if (!files.product_demographics) return [];
+          return files.product_demographics.rows
+            .filter(r => String(r['상품ID']) === pidStr)
+            .sort((a, b) => (b['결제금액'] || 0) - (a['결제금액'] || 0))
+            .slice(0, 8);
+        }, [files.product_demographics, pidStr]);
+
+        // 지역 TOP 8
+        const regions = useMemo(() => {
+          if (!files.product_region) return [];
+          return files.product_region.rows
+            .filter(r => String(r['상품ID']) === pidStr)
+            .sort((a, b) => (b['결제금액'] || 0) - (a['결제금액'] || 0))
+            .slice(0, 8);
+        }, [files.product_region, pidStr]);
+
+        const hasAny = channels.length || keywords.length || demos.length || regions.length;
+        if (!hasAny) {
+          return <div className="text-[11px] text-neutral-400 font-bold py-2">상세 데이터 없음 (상품_마케팅채널 / 상품_검색채널 / 상품_인구통계 / 상품_지역 파일 업로드 시 자동 표시)</div>;
+        }
+
+        return (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {channels.length > 0 && (
+              <div className="bg-white border border-neutral-400 p-2" style={{borderRadius:'2px'}}>
+                <div className="text-[10px] font-black tracking-widest text-neutral-700 mb-1.5">채널 기여 TOP {channels.length}</div>
+                <table className="w-full text-[10px]">
+                  <tbody>
+                    {channels.map(c => {
+                      const isAd = /광고|ADVoost/.test(c.name);
+                      const isDirect = c.name === '(알수없음)';
+                      const tag = isAd ? '광고' : isDirect ? '직접' : '자연';
+                      const tagCls = isAd ? 'bg-black text-white' : isDirect ? 'bg-neutral-300 text-neutral-700' : 'bg-neutral-100 border border-neutral-400 text-neutral-700';
+                      return (
+                        <tr key={c.name} className="border-b border-neutral-100">
+                          <td className="py-1 truncate max-w-[160px]" title={c.name}>{c.name}</td>
+                          <td className="py-1 w-10"><span className={`text-[8px] font-black tracking-widest uppercase px-1 ${tagCls}`} style={{borderRadius:'2px'}}>{tag}</span></td>
+                          <td className="py-1 text-right font-mono whitespace-nowrap">{fmtKRW(c.revenue)}</td>
+                          <td className="py-1 text-right font-mono w-10 text-neutral-500">{fmtPct(c.share)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {keywords.length > 0 && (
+              <div className="bg-white border border-neutral-400 p-2" style={{borderRadius:'2px'}}>
+                <div className="text-[10px] font-black tracking-widest text-neutral-700 mb-1.5">유입 키워드 TOP {keywords.length}</div>
+                <table className="w-full text-[10px]">
+                  <thead>
+                    <tr className="border-b border-neutral-200">
+                      <th className="text-left py-1 font-black tracking-widest uppercase">키워드</th>
+                      <th className="text-right py-1 font-black tracking-widest uppercase">자연</th>
+                      <th className="text-right py-1 font-black tracking-widest uppercase">광고</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {keywords.map(k => (
+                      <tr key={k.keyword} className="border-b border-neutral-100">
+                        <td className="py-1 truncate max-w-[120px]" title={k.keyword}>{k.keyword}</td>
+                        <td className="py-1 text-right font-mono whitespace-nowrap">{fmtKRW(k.natural)}</td>
+                        <td className="py-1 text-right font-mono whitespace-nowrap text-neutral-500">{fmtKRW(k.ad)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {demos.length > 0 && (
+              <div className="bg-white border border-neutral-400 p-2" style={{borderRadius:'2px'}}>
+                <div className="text-[10px] font-black tracking-widest text-neutral-700 mb-1.5">구매자 인구통계 TOP {demos.length}</div>
+                <table className="w-full text-[10px]">
+                  <tbody>
+                    {demos.map((d, i) => (
+                      <tr key={i} className="border-b border-neutral-100">
+                        <td className="py-1">{d['성별']}</td>
+                        <td className="py-1">{d['나이']}</td>
+                        <td className="py-1 text-right font-mono">{fmtKRW(d['결제금액'])}</td>
+                        <td className="py-1 text-right font-mono text-neutral-500">{fmtNum(d['결제수'])}건</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {regions.length > 0 && (
+              <div className="bg-white border border-neutral-400 p-2" style={{borderRadius:'2px'}}>
+                <div className="text-[10px] font-black tracking-widest text-neutral-700 mb-1.5">구매 지역 TOP {regions.length}</div>
+                <table className="w-full text-[10px]">
+                  <tbody>
+                    {regions.map((r, i) => (
+                      <tr key={i} className="border-b border-neutral-100">
+                        <td className="py-1">{r['지역(대)']}</td>
+                        <td className="py-1 truncate max-w-[80px]">{r['지역(소)']}</td>
+                        <td className="py-1 text-right font-mono">{fmtKRW(r['결제금액'])}</td>
+                        <td className="py-1 text-right font-mono text-neutral-500">{fmtNum(r['결제수'])}건</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // ───────── 스마트스토어 분석 (Phase A) ─────────
+      const SmartstoreTab = () => {
+        const [files, setFiles]       = useState({});   // type → { filename, sheetName, rows }
+        const [error, setError]       = useState('');
+        const [loading, setLoading]   = useState(false);
+        const [expandedProduct, setExpandedProduct] = useState(null);  // 드릴다운된 상품ID
+        const fileInputRef = useRef(null);
+
+        const handleFiles = async (fileList) => {
+          if (!fileList || !fileList.length) return;
+          setError(''); setLoading(true);
+          const next = { ...files };
+          const errs = [];
+
+          for (const file of Array.from(fileList)) {
+            const type = detectSmartstoreType(file.name);
+            if (!type) { errs.push(`인식 실패: ${file.name}`); continue; }
+            try {
+              const parsed = await parseExcelDict(file);
+              next[type] = { filename: file.name, ...parsed };
+            } catch (err) {
+              errs.push(`${file.name}: ${err.message}`);
+            }
+          }
+          setFiles(next);
+          if (errs.length) setError(errs.join(' · '));
+          setLoading(false);
+        };
+
+        const onDrop = (e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); };
+
+        // 분석 (파일 바뀔 때만 재계산)
+        const analyses = useMemo(() => ({
+          bestsellers:  analyzeBestsellers(files.product_performance),
+          categories:   analyzeCategoryShare(files.product_performance),
+          channels:     analyzeChannels(files.product_channel),
+          orphans:      findOrphanKeywords(files.product_keyword),
+          classified:   classifyProducts(files.product_performance),
+          demographics: aggregateDemographics(files.product_demographics),
+          hourly:       aggregateHourly(files.sales_performance),
+        }), [files]);
+
+        const filesUploaded = Object.keys(files).length;
+        const hasAnalysis   = filesUploaded > 0;
+        const adDep = analyses.channels && analyses.channels.total > 0
+          ? (analyses.channels.adRevenue / analyses.channels.total) * 100 : 0;
+
+        return (
+          <div>
+            <h1 className="text-2xl font-black text-black tracking-tight mb-1">스마트스토어 분석</h1>
+            <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">2 · SMARTSTORE ANALYTICS</p>
+
+            {/* ─── 매일 사용법 안내 ─── */}
+            <div className="bg-green-50 border-2 border-green-700 mb-4" style={{borderRadius:'2px'}}>
+              <div className="bg-green-700 text-white px-3 py-2 flex items-center justify-between">
+                <div className="text-[11px] font-black tracking-widest uppercase">매일 사용법 · 스마트스토어 통계 8개 다운로드</div>
+                <span className="text-[10px] font-bold opacity-80">3단계로 분석</span>
+              </div>
+              <div className="px-4 py-3 space-y-3">
+                {/* 1단계 */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-green-900 mb-1">1단계 — 스마트스토어센터 통계 보고서 8개 다운로드</div>
+                  <div className="bg-white border border-neutral-400 p-2 text-[11px] font-bold space-y-0.5" style={{borderRadius:'2px'}}>
+                    <div>📍 <a href="https://sell.smartstore.naver.com/" target="_blank" rel="noopener noreferrer" className="underline">sell.smartstore.naver.com</a> → 통계 → 다음 8개 보고서 다운로드:</div>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] text-neutral-700 mt-1.5">
+                      <div>① 상품성과</div>
+                      <div>② 상품_마케팅채널</div>
+                      <div>③ 상품_검색채널</div>
+                      <div>④ 상품_인구통계</div>
+                      <div>⑤ 상품_지역</div>
+                      <div>⑥ 상품_고객프로파일_결혼상태</div>
+                      <div>⑦ 판매성과</div>
+                      <div>⑧ 배송통계</div>
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-neutral-600 mt-1 font-bold">
+                    기간을 12일(이전 광고분석과 동일)로 맞추면 비교 정확. 파일명은 자동 인식되니 그대로 저장.
+                  </div>
+                </div>
+
+                {/* 2단계 */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-green-900 mb-1">2단계 — 8개 .xlsx 파일을 아래 드롭존에 한꺼번에 드래그</div>
+                  <div className="bg-white border border-neutral-400 p-2 font-mono text-[11px]" style={{borderRadius:'2px'}}>
+                    Ctrl + A 또는 Shift + 클릭으로 8개 다 선택 → 드래그 한 번
+                  </div>
+                  <div className="text-[10px] text-neutral-600 mt-1 font-bold">
+                    파일명에 "상품성과", "상품_마케팅채널" 등 키워드가 있으면 자동 매핑됨. 일부만 올려도 OK.
+                  </div>
+                </div>
+
+                {/* 3단계 */}
+                <div>
+                  <div className="text-[10px] font-black tracking-widest text-green-900 mb-1">3단계 — 자동 분석 결과 확인</div>
+                  <ul className="text-[11px] text-neutral-700 font-bold space-y-0.5 ml-3">
+                    <li>• 정비 액션 카드 (유지·강화 / 점검 / 정비 3등급 자동 분류)</li>
+                    <li>• 카테고리 매출 비중 + 채널 매출 분포 (광고 vs 자연 vs 직접)</li>
+                    <li>• 베스트셀러 TOP 15 — 행 클릭 시 채널·키워드·인구·지역 드릴다운</li>
+                    <li>• 광고 OFF 키워드 경고 (자연 매출 발생하는데 광고 미진행)</li>
+                    <li>• 인구통계 매트릭스 + 시간대 매출 패턴 (타겟팅용)</li>
+                  </ul>
+                </div>
+
+                {/* 팁 */}
+                <div className="bg-amber-50 border border-amber-600 px-2 py-1.5 text-[10px] font-bold text-amber-900" style={{borderRadius:'2px'}}>
+                  <b>광고 분석(1번 탭)과 함께 보세요:</b> 스마트스토어가 실제 매출, 광고 분석은 광고 매출 → 차이가 "광고 없이 들어온 비율" 입니다.
+                </div>
+              </div>
+            </div>
+
+            {/* 드롭존 */}
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={onDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className="bg-white border-2 border-dashed border-black p-8 text-center cursor-pointer hover:bg-neutral-50 transition-all mb-3"
+              style={{borderRadius:'2px'}}
+            >
+              <div className="text-sm font-black tracking-widest uppercase text-black mb-1">
+                스마트스토어 통계 엑셀 한꺼번에 드래그 (최대 8개)
+              </div>
+              <div className="text-[11px] text-neutral-500 font-bold">
+                파일명으로 자동 인식 · .xlsx 지원 · 일부만 올려도 OK (있는 데이터만 분석)
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xlsx"
+                multiple
+                className="hidden"
+                onChange={(e) => handleFiles(e.target.files)}
+              />
+            </div>
+
+            {/* 8종 인식 체크리스트 */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-1 mb-4">
+              {Object.entries(SMARTSTORE_FILE_TYPES)
+                .sort((a, b) => a[1].order - b[1].order)
+                .map(([key, def]) => {
+                  const loaded = !!files[key];
+                  return (
+                    <div key={key} className={`px-2 py-1.5 text-[10px] font-black tracking-widest ${
+                      loaded
+                        ? 'bg-green-50 border-2 border-green-700 text-green-700'
+                        : 'bg-neutral-50 border-2 border-neutral-300 text-neutral-400'
+                    }`} style={{borderRadius:'2px'}}>
+                      {loaded ? '✓ ' : '· '}{def.label}
+                    </div>
+                  );
+                })}
+            </div>
+
+            {loading && (
+              <div className="bg-neutral-100 border border-neutral-300 px-4 py-3 mb-4" style={{borderRadius:'2px'}}>
+                <span className="text-[11px] font-black tracking-widest uppercase">분석 중...</span>
+              </div>
+            )}
+
+            {error && (
+              <div className="bg-red-50 border-2 border-red-600 p-4 mb-4" style={{borderRadius:'2px'}}>
+                <span className="text-xs font-black text-red-700">{error}</span>
+              </div>
+            )}
+
+            {/* ─── 1. 분석 결과 요약 (4 카드) ─── */}
+            {hasAnalysis && analyses.bestsellers && (
+              <>
+                <div className="text-sm font-black tracking-widest uppercase text-black mb-3">분석 결과 요약</div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-6">
+                  <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-500">총매출</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(analyses.bestsellers.totalRevenue)}</div>
+                  </div>
+                  <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-500">상품 수</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtNum(analyses.bestsellers.totalProducts)}개</div>
+                  </div>
+                  <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-500">TOP 15 매출 비중</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtPct(analyses.bestsellers.top15Share)}</div>
+                    <div className="text-[9px] text-neutral-400 font-bold mt-1">상위 15개 상품 집중도</div>
+                  </div>
+                  <div className="bg-black text-white p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-300">광고 의존도</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{analyses.channels ? fmtPct(adDep) : '—'}</div>
+                    <div className="text-[9px] text-neutral-400 font-bold mt-1">전체 매출 중 광고 기여</div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {/* ─── 1.5 정비 액션 카드 (유지/점검/정비) ─── */}
+            {analyses.classified && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-1">정비 액션 카드</div>
+                <div className="text-[11px] text-neutral-500 mb-3 font-bold">
+                  매출 순위 + 환불율로 3등급 자동 분류 · 광고 운영 의사결정 즉시 활용
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+
+                  {/* 유지·강화 */}
+                  <div className="bg-green-50 border-2 border-green-700 overflow-hidden" style={{borderRadius:'2px'}}>
+                    <div className="bg-green-700 text-white px-3 py-2 text-[11px] font-black tracking-widest uppercase">
+                      유지·강화 ({analyses.classified.keep.length}개)
+                    </div>
+                    <div className="px-2 py-1.5 text-[10px] text-green-900 font-bold border-b border-green-300 bg-green-100">
+                      → 광고비 증액 · 입찰가 ↑ · 노출 확대 후보
+                    </div>
+                    <ul className="text-[10px] divide-y divide-green-200">
+                      {analyses.classified.keep.length === 0 && (
+                        <li className="px-2 py-3 text-neutral-400 text-center">해당 없음</li>
+                      )}
+                      {analyses.classified.keep.map((p, i) => (
+                        <li key={p['상품ID'] || i} className="px-2 py-1.5 flex justify-between gap-2">
+                          <span className="truncate flex-1" title={p['상품명']}>{(p['상품명'] || '').slice(0, 32)}</span>
+                          <span className="font-mono whitespace-nowrap text-green-700 font-black">{fmtKRW(p['결제금액'])}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* 점검 */}
+                  <div className="bg-amber-50 border-2 border-amber-700 overflow-hidden" style={{borderRadius:'2px'}}>
+                    <div className="bg-amber-700 text-white px-3 py-2 text-[11px] font-black tracking-widest uppercase">
+                      점검 ({analyses.classified.review.length}개)
+                    </div>
+                    <div className="px-2 py-1.5 text-[10px] text-amber-900 font-bold border-b border-amber-300 bg-amber-100">
+                      → 환불 원인 분석 · 상세페이지 개선 · 입찰가 ↓
+                    </div>
+                    <ul className="text-[10px] divide-y divide-amber-200">
+                      {analyses.classified.review.length === 0 && (
+                        <li className="px-2 py-3 text-neutral-400 text-center">환불율 15%↑ 상품 없음</li>
+                      )}
+                      {analyses.classified.review.map((p, i) => (
+                        <li key={p['상품ID'] || i} className="px-2 py-1.5 flex justify-between gap-2">
+                          <span className="truncate flex-1" title={p['상품명']}>{(p['상품명'] || '').slice(0, 32)}</span>
+                          <span className="font-mono whitespace-nowrap text-amber-700 font-black">환불 {p._refundPct.toFixed(1)}%</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* 정비 */}
+                  <div className="bg-red-50 border-2 border-red-700 overflow-hidden" style={{borderRadius:'2px'}}>
+                    <div className="bg-red-700 text-white px-3 py-2 text-[11px] font-black tracking-widest uppercase">
+                      정비 ({analyses.classified.cleanup.length}개)
+                    </div>
+                    <div className="px-2 py-1.5 text-[10px] text-red-900 font-bold border-b border-red-300 bg-red-100">
+                      → 광고 일시중지 · 상품 점검 · 키워드 재검토
+                    </div>
+                    <ul className="text-[10px] divide-y divide-red-200">
+                      {analyses.classified.cleanup.length === 0 && (
+                        <li className="px-2 py-3 text-neutral-400 text-center">해당 없음</li>
+                      )}
+                      {analyses.classified.cleanup.map((p, i) => (
+                        <li key={p['상품ID'] || i} className="px-2 py-1.5 flex justify-between gap-2">
+                          <span className="truncate flex-1" title={p['상품명']}>{(p['상품명'] || '').slice(0, 32)}</span>
+                          <span className="font-mono whitespace-nowrap text-red-700 font-black">{fmtKRW(p['결제금액'])}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                </div>
+              </div>
+            )}
+
+            {/* ─── 2. 카테고리 매출 비중 ─── */}
+            {analyses.categories && analyses.categories.length > 0 && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-2">카테고리 매출 비중</div>
+                <div className="bg-white border-2 border-black overflow-x-auto" style={{borderRadius:'2px'}}>
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b-2 border-black bg-neutral-50">
+                        <th className="text-left  px-3 py-2 font-black uppercase tracking-widest">카테고리</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">매출</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">비중</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">상품 수</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyses.categories.map((c) => (
+                        <tr key={c.category} className="border-b border-neutral-200">
+                          <td className="px-3 py-1.5 font-bold">{c.category}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(c.revenue)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono font-black">{fmtPct(c.share)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{fmtNum(c.count)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ─── 3. 채널 매출 분포 ─── */}
+            {analyses.channels && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-1">채널 매출 분포</div>
+                <div className="text-[11px] text-neutral-500 mb-3 font-bold">
+                  광고 / 자연 검색 / 직접 유입 비중. 자연 비중이 높을수록 SEO 강함, 광고 의존도 낮음
+                </div>
+                <div className="grid grid-cols-3 gap-2 mb-3">
+                  <div className="bg-black text-white p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-300">광고</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(analyses.channels.adRevenue)}</div>
+                    <div className="text-[9px] text-neutral-400 mt-1 font-bold">{fmtPct(analyses.channels.adRevenue / analyses.channels.total * 100)}</div>
+                  </div>
+                  <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-500">자연 검색</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(analyses.channels.naturalRevenue)}</div>
+                    <div className="text-[9px] text-neutral-400 mt-1 font-bold">{fmtPct(analyses.channels.naturalRevenue / analyses.channels.total * 100)}</div>
+                  </div>
+                  <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                    <div className="text-[10px] font-black tracking-widest text-neutral-500">직접 / 알수없음</div>
+                    <div className="text-lg font-black tracking-tight mt-1">{fmtKRW(analyses.channels.directRevenue)}</div>
+                    <div className="text-[9px] text-neutral-400 mt-1 font-bold">{fmtPct(analyses.channels.directRevenue / analyses.channels.total * 100)}</div>
+                  </div>
+                </div>
+
+                {/* 채널 상세 테이블 */}
+                <div className="bg-white border-2 border-black overflow-auto" style={{borderRadius:'2px', maxHeight:'400px'}}>
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b-2 border-black">
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black uppercase tracking-widest w-10 border-b-2 border-black">#</th>
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black uppercase tracking-widest border-b-2 border-black">채널</th>
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black uppercase tracking-widest border-b-2 border-black">구분</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-3 py-2 font-black uppercase tracking-widest border-b-2 border-black">매출</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-3 py-2 font-black uppercase tracking-widest border-b-2 border-black">비중</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyses.channels.channels.map((c, i) => {
+                        const tag = c.isAd ? '광고' : c.isDirect ? '직접' : '자연';
+                        const tagCls = c.isAd
+                          ? 'bg-black text-white'
+                          : c.isDirect
+                            ? 'bg-neutral-300 text-neutral-700'
+                            : 'bg-neutral-100 text-neutral-700 border border-neutral-400';
+                        return (
+                          <tr key={c.name} className="border-b border-neutral-200">
+                            <td className="px-3 py-1.5 font-black text-neutral-500">{i+1}</td>
+                            <td className="px-3 py-1.5 font-bold truncate max-w-[260px]" title={c.name}>{c.name}</td>
+                            <td className="px-3 py-1.5">
+                              <span className={`text-[9px] font-black tracking-widest uppercase px-1.5 py-0.5 ${tagCls}`} style={{borderRadius:'2px'}}>{tag}</span>
+                            </td>
+                            <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(c.revenue)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{fmtPct(c.revenue / analyses.channels.total * 100)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ─── 4. 베스트셀러 TOP 15 (드릴다운) ─── */}
+            {analyses.bestsellers && analyses.bestsellers.top15.length > 0 && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-1">베스트셀러 TOP 15</div>
+                <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                  매출 큰 순서 · 환불율 색상: 5%↓ 녹색 / 5~10% 황색 / 10%↑ 적색 · <span className="text-black">행 클릭 시 채널·키워드·인구·지역 드릴다운</span>
+                </div>
+                <div className="bg-white border-2 border-black overflow-auto" style={{borderRadius:'2px', maxHeight:'700px'}}>
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b-2 border-black">
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest w-10 border-b-2 border-black">#</th>
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">카테고리</th>
+                        <th className="sticky top-0 bg-neutral-50 text-left  px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">상품명</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">매출</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">결제</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">수량</th>
+                        <th className="sticky top-0 bg-neutral-50 text-right px-2 py-2 font-black uppercase tracking-widest border-b-2 border-black">환불율</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyses.bestsellers.top15.map((p, i) => {
+                        const pid = p['상품ID'];
+                        const isExpanded = String(expandedProduct) === String(pid);
+                        const rb = (p['환불비율(결제금액)'] || 0) * 100;
+                        const rbCls = rb >= 10 ? 'text-red-700' : rb >= 5 ? 'text-amber-700' : 'text-green-700';
+                        return (
+                          <React.Fragment key={pid || i}>
+                            <tr
+                              onClick={() => setExpandedProduct(isExpanded ? null : pid)}
+                              className={`border-b border-neutral-200 cursor-pointer hover:bg-neutral-100 transition-colors ${isExpanded ? '!bg-neutral-200' : ''}`}
+                            >
+                              <td className="px-2 py-1.5 font-black text-neutral-500 whitespace-nowrap">
+                                <span className="inline-block w-3 text-[9px] text-black">{isExpanded ? '▼' : '▶'}</span> {i+1}
+                              </td>
+                              <td className="px-2 py-1.5 text-[10px] text-neutral-600 whitespace-nowrap">{p['상품카테고리(소)'] || '—'}</td>
+                              <td className="px-2 py-1.5 truncate max-w-[320px]" title={p['상품명']}>{p['상품명']}</td>
+                              <td className="px-2 py-1.5 text-right font-mono font-black">{fmtKRW(p['결제금액'])}</td>
+                              <td className="px-2 py-1.5 text-right font-mono">{fmtNum(p['결제수'])}</td>
+                              <td className="px-2 py-1.5 text-right font-mono">{fmtNum(p['결제상품수량'])}</td>
+                              <td className={`px-2 py-1.5 text-right font-mono font-black ${rbCls}`}>{fmtPct(rb)}</td>
+                            </tr>
+                            {isExpanded && (
+                              <tr>
+                                <td colSpan={7} className="bg-neutral-50 px-4 py-3 border-b-2 border-neutral-400">
+                                  <ProductDrilldown productId={pid} files={files} />
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ─── 5. 인구통계 매트릭스 (성별 × 연령) ─── */}
+            {analyses.demographics && analyses.demographics.cells.length > 0 && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-1">인구통계 매트릭스 (성별 × 연령)</div>
+                <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                  광고 타겟팅에 활용. 매출 비중 큰 셀에 광고 집중
+                </div>
+                <div className="bg-white border-2 border-black overflow-auto" style={{borderRadius:'2px', maxHeight:'400px'}}>
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b-2 border-black bg-neutral-50">
+                        <th className="text-left  px-3 py-2 font-black uppercase tracking-widest">성별</th>
+                        <th className="text-left  px-3 py-2 font-black uppercase tracking-widest">연령</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">매출</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">비중</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">결제 건수</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyses.demographics.cells
+                        .sort((a, b) => b.revenue - a.revenue)
+                        .slice(0, 30)
+                        .map((m, i) => {
+                          const intensity = Math.min(m.share / 10, 1); // 0~1
+                          const bgClass = m.gender === '여성' ? 'bg-pink-50' : m.gender === '남성' ? 'bg-blue-50' : '';
+                          return (
+                            <tr key={i} className={`border-b border-neutral-200 ${bgClass}`}>
+                              <td className="px-3 py-1.5 font-bold">{m.gender}</td>
+                              <td className="px-3 py-1.5">{m.age}</td>
+                              <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(m.revenue)}</td>
+                              <td className="px-3 py-1.5 text-right font-mono font-black">{fmtPct(m.share)}</td>
+                              <td className="px-3 py-1.5 text-right font-mono text-neutral-500">{fmtNum(m.count)}</td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ─── 6. 시간대 매출 패턴 ─── */}
+            {analyses.hourly && analyses.hourly.hours.length > 0 && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase mb-1">시간대 매출 패턴 (광고 노출 시간 추천)</div>
+                <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                  매출 큰 시간대에 광고 입찰가 부스트, 새벽 저비중 시간대 노출 줄여 효율 ↑
+                </div>
+                <div className="bg-white border-2 border-black p-3" style={{borderRadius:'2px'}}>
+                  {analyses.hourly.hours.map((h) => {
+                    const barWidth = Math.max(2, h.share * 6); // 0~100% → ~0~600px
+                    return (
+                      <div key={h.hour} className="flex items-center gap-2 mb-1 text-[11px]">
+                        <span className="font-mono text-neutral-600 w-10">{h.hour}</span>
+                        <div className="flex-1 bg-neutral-100" style={{borderRadius:'2px', height:'18px'}}>
+                          <div className="bg-black h-full flex items-center justify-end px-1.5 text-white font-mono text-[10px]"
+                            style={{width: `${Math.min(barWidth, 100)}%`, borderRadius:'2px', minWidth: '12px'}}>
+                            {h.share >= 4 ? fmtPct(h.share) : ''}
+                          </div>
+                        </div>
+                        <span className="font-mono text-neutral-500 w-24 text-right">{fmtKRW(h.revenue)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ─── 5. 광고 OFF 키워드 경고 ─── */}
+            {analyses.orphans && analyses.orphans.length > 0 && (
+              <div className="mb-6">
+                <div className="text-sm font-black tracking-widest uppercase text-red-700 mb-1">
+                  광고 OFF 키워드 · 즉시 추가 권장 ({analyses.orphans.length}개)
+                </div>
+                <div className="text-[11px] text-neutral-500 mb-2 font-bold">
+                  자연 검색으로 매출 발생 중이지만 광고 미진행. 광고 추가하면 노출·매출 2~3배 가능
+                </div>
+                <div className="bg-red-50 border-2 border-red-600 overflow-x-auto" style={{borderRadius:'2px'}}>
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b-2 border-red-600 bg-red-100">
+                        <th className="text-left  px-3 py-2 font-black uppercase tracking-widest w-10">#</th>
+                        <th className="text-left  px-3 py-2 font-black uppercase tracking-widest">키워드</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">자연 매출</th>
+                        <th className="text-right px-3 py-2 font-black uppercase tracking-widest">광고 매출</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyses.orphans.map((k, i) => (
+                        <tr key={k.keyword} className="border-b border-red-200">
+                          <td className="px-3 py-1.5 font-black">{i+1}</td>
+                          <td className="px-3 py-1.5 font-bold">{k.keyword}</td>
+                          <td className="px-3 py-1.5 text-right font-mono font-black text-red-700">{fmtKRW(k.natural)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono text-neutral-400">{fmtKRW(k.ad)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 파일 안 올렸을 때 안내 */}
+            {!hasAnalysis && !loading && !error && (
+              <div className="bg-neutral-50 border border-neutral-300 p-5 text-center" style={{borderRadius:'2px'}}>
+                <div className="text-xs font-bold text-neutral-500">
+                  분석을 보려면 스마트스토어 통계 엑셀을 업로드하세요.<br/>
+                  최소 <b>상품성과</b> 파일 1개만 있어도 베스트셀러 / 카테고리 분석은 가능합니다.
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // ───────── 분석 히스토리 (Phase 6) ─────────
+      const HistoryTab = () => {
+        const [history, setHistory] = useState(() => {
+          try { return JSON.parse(localStorage.getItem('adanalytics_history') || '[]'); }
+          catch { return []; }
+        });
+        const [appliedActions, setAppliedActions] = useState(() => {
+          try { return JSON.parse(localStorage.getItem('adanalytics_applied_actions') || '{}'); }
+          catch { return {}; }
+        });
+        const [expandedId, setExpandedId] = useState(null);
+
+        const persistHistory = (next) => {
+          setHistory(next);
+          localStorage.setItem('adanalytics_history', JSON.stringify(next));
+        };
+        const persistApplied = (next) => {
+          setAppliedActions(next);
+          localStorage.setItem('adanalytics_applied_actions', JSON.stringify(next));
+        };
+
+        const deleteEntry = (id) => {
+          if (!confirm('이 분석 기록을 삭제할까요?')) return;
+          persistHistory(history.filter(h => h.id !== id));
+        };
+
+        const clearAll = () => {
+          if (!confirm(`히스토리 전체 ${history.length}건을 삭제할까요? (되돌릴 수 없음)`)) return;
+          persistHistory([]);
+        };
+
+        const unapply = (actionId) => {
+          if (!confirm('이 적용을 철회할까요? (스냅샷 데이터도 함께 삭제됨)')) return;
+          const next = { ...appliedActions };
+          delete next[actionId];
+          persistApplied(next);
+        };
+
+        const clearAllApplied = () => {
+          if (!confirm(`적용 이력 ${Object.keys(appliedActions).length}건 전체를 삭제할까요?`)) return;
+          persistApplied({});
+        };
+
+        // 각 분석 entry 요약 계산
+        const summarize = (entry) => {
+          const rows = entry.rows || [];
+          let cost = 0, revenue = 0, clicks = 0, conv = 0;
+          for (const r of rows) {
+            cost    += Number(r.cost)        || 0;
+            revenue += Number(r.revenue)     || 0;
+            clicks  += Number(r.clicks)      || 0;
+            conv    += Number(r.conversions) || 0;
+          }
+          return {
+            cost, revenue, clicks, conversions: conv,
+            roas: cost > 0 ? (revenue / cost) * 100 : 0,
+          };
+        };
+
+        const appliedEntries = Object.entries(appliedActions)
+          .sort((a, b) => new Date(b[1].appliedAt) - new Date(a[1].appliedAt));
+
+        return (
+          <div>
+            <h1 className="text-2xl font-black text-black tracking-tight mb-1">분석 히스토리</h1>
+            <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">6 · HISTORY</p>
+
+            {/* ─── 저장된 분석 목록 ─── */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-sm font-black tracking-widest uppercase">저장된 분석 ({history.length}건)</div>
+              {history.length > 0 && (
+                <button onClick={clearAll}
+                  className="text-[10px] font-black tracking-widest uppercase px-2 py-1 bg-white border-2 border-red-600 text-red-700 hover:bg-red-600 hover:text-white transition-all"
+                  style={{borderRadius:'2px'}}>
+                  전체 삭제
+                </button>
+              )}
+            </div>
+
+            {history.length === 0 ? (
+              <div className="bg-neutral-50 border border-neutral-300 p-5 text-center mb-6" style={{borderRadius:'2px'}}>
+                <div className="text-xs font-bold text-neutral-500">
+                  저장된 분석이 없습니다.<br/>
+                  광고 분석 탭에서 엑셀/CSV 업로드 후 <b>[히스토리에 저장]</b> 버튼을 누르면 여기에 쌓입니다.
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2 mb-8">
+                {history.map((entry) => {
+                  const isExpanded = expandedId === entry.id;
+                  const s = summarize(entry);
+                  return (
+                    <div key={entry.id} className="bg-white border-2 border-black overflow-hidden" style={{borderRadius:'2px'}}>
+                      <div
+                        onClick={() => setExpandedId(isExpanded ? null : entry.id)}
+                        className={`px-3 py-2 cursor-pointer hover:bg-neutral-50 flex items-center justify-between gap-3 flex-wrap ${isExpanded ? 'bg-neutral-100' : ''}`}
+                      >
+                        <div className="flex items-center gap-3 flex-wrap">
+                          <span className="text-[10px] font-black text-neutral-500">{isExpanded ? '▼' : '▶'}</span>
+                          <span className="text-xs font-mono text-neutral-500">
+                            {new Date(entry.uploadedAt).toLocaleString('ko-KR', {year:'2-digit',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
+                          </span>
+                          {entry.platform && (
+                            <span className="bg-black text-white text-[10px] font-black px-2 py-0.5 tracking-widest uppercase" style={{borderRadius:'2px'}}>
+                              {entry.platform}
+                            </span>
+                          )}
+                          <span className="text-xs font-bold truncate max-w-[280px]" title={entry.filename}>{entry.filename}</span>
+                          <span className="text-[11px] text-neutral-500 font-mono">{entry.rowCount}행</span>
+                        </div>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deleteEntry(entry.id); }}
+                          className="text-[10px] font-black tracking-widest uppercase px-2 py-1 bg-white border border-red-500 text-red-600 hover:bg-red-600 hover:text-white transition-all"
+                          style={{borderRadius:'2px'}}
+                        >
+                          삭제
+                        </button>
+                      </div>
+                      {isExpanded && (
+                        <div className="bg-neutral-50 border-t-2 border-black px-3 py-3">
+                          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                            <div className="bg-white border border-neutral-300 p-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[9px] font-black tracking-widest text-neutral-500">광고비</div>
+                              <div className="text-sm font-black mt-0.5">{fmtKRW(s.cost)}</div>
+                            </div>
+                            <div className="bg-white border border-neutral-300 p-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[9px] font-black tracking-widest text-neutral-500">매출</div>
+                              <div className="text-sm font-black mt-0.5">{fmtKRW(s.revenue)}</div>
+                            </div>
+                            <div className="bg-white border border-neutral-300 p-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[9px] font-black tracking-widest text-neutral-500">ROAS</div>
+                              <div className={`text-sm font-black mt-0.5 ${roasColor(s.roas)}`}>{fmtPct(s.roas)}</div>
+                            </div>
+                            <div className="bg-white border border-neutral-300 p-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[9px] font-black tracking-widest text-neutral-500">클릭</div>
+                              <div className="text-sm font-black mt-0.5">{fmtNum(s.clicks)}</div>
+                            </div>
+                            <div className="bg-white border border-neutral-300 p-2" style={{borderRadius:'2px'}}>
+                              <div className="text-[9px] font-black tracking-widest text-neutral-500">전환</div>
+                              <div className="text-sm font-black mt-0.5">{fmtNum(s.conversions)}</div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* ─── 적용한 권장 액션 이력 ─── */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-sm font-black tracking-widest uppercase">적용한 권장 액션 ({appliedEntries.length}건)</div>
+              {appliedEntries.length > 0 && (
+                <button onClick={clearAllApplied}
+                  className="text-[10px] font-black tracking-widest uppercase px-2 py-1 bg-white border-2 border-red-600 text-red-700 hover:bg-red-600 hover:text-white transition-all"
+                  style={{borderRadius:'2px'}}>
+                  전체 철회
+                </button>
+              )}
+            </div>
+
+            {appliedEntries.length === 0 ? (
+              <div className="bg-neutral-50 border border-neutral-300 p-5 text-center" style={{borderRadius:'2px'}}>
+                <div className="text-xs font-bold text-neutral-500">
+                  적용한 권장 액션이 없습니다.<br/>
+                  광고 분석 탭의 <b>광고 정비 권장 사항</b>에서 체크박스를 누르면 여기에 기록됩니다.
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white border-2 border-black overflow-auto" style={{borderRadius:'2px', maxHeight:'600px'}}>
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="border-b-2 border-black bg-neutral-50">
+                      <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">적용 일시</th>
+                      <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">키워드</th>
+                      <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">위치</th>
+                      <th className="sticky top-0 bg-neutral-50 text-left  px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">권장 액션</th>
+                      <th className="sticky top-0 bg-neutral-50 text-right px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">적용 당시 비용</th>
+                      <th className="sticky top-0 bg-neutral-50 text-right px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black">적용 당시 매출</th>
+                      <th className="sticky top-0 bg-neutral-50 text-right px-3 py-2 font-black tracking-widest uppercase border-b-2 border-black w-20"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {appliedEntries.map(([id, a]) => (
+                      <tr key={id} className="border-b border-neutral-200">
+                        <td className="px-3 py-1.5 font-mono text-neutral-600 whitespace-nowrap">
+                          {new Date(a.appliedAt).toLocaleString('ko-KR', {year:'2-digit',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
+                        </td>
+                        <td className="px-3 py-1.5 font-bold">"{a.keyword}"</td>
+                        <td className="px-3 py-1.5">
+                          <span className="text-neutral-600 text-[10px]">{a.path?.campaign}</span>
+                          <span className="text-neutral-400 mx-1">→</span>
+                          <span className="font-bold">{a.path?.adGroup}</span>
+                          {a.path?.adType && (
+                            <span className={`ml-1 inline-block border text-[9px] font-black tracking-widest px-1 ${adTypeBadgeCls(a.path.adType)}`} style={{borderRadius:'2px'}}>
+                              {fmtAdType(a.path.adType)}
+                            </span>
+                          )}
+                          {a.path?.device && (
+                            <span className="ml-1 inline-block bg-neutral-700 text-white text-[9px] font-black tracking-widest px-1" style={{borderRadius:'2px'}}>
+                              {a.path.device}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-neutral-700 text-[10px]">{a.actionText}</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(a.snapshot?.cost)}</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{fmtKRW(a.snapshot?.revenue)}</td>
+                        <td className="px-3 py-1.5 text-right">
+                          <button
+                            onClick={() => unapply(id)}
+                            className="text-[9px] font-black tracking-widest uppercase px-1.5 py-0.5 bg-white border border-red-500 text-red-600 hover:bg-red-600 hover:text-white transition-all"
+                            style={{borderRadius:'2px'}}
+                          >
+                            철회
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // ───────── 설정 ─────────
+      const SettingsTab = () => {
+        const [apiKey, setApiKey] = useState(() => {
+          try { return JSON.parse(localStorage.getItem('adanalytics_settings') || '{}').anthropicApiKey || ''; }
+          catch { return ''; }
+        });
+        const [savedMsg, setSavedMsg] = useState('');
+
+        const save = () => {
+          const settings = { anthropicApiKey: apiKey };
+          localStorage.setItem('adanalytics_settings', JSON.stringify(settings));
+          setSavedMsg('저장됨');
+          setTimeout(() => setSavedMsg(''), 2000);
+        };
+
+        return (
+          <div>
+            <h1 className="text-2xl font-black text-black tracking-tight mb-1">설정</h1>
+            <p className="text-xs text-neutral-500 font-bold tracking-widest uppercase mb-6">12 · SETTINGS</p>
+
+            <div className="bg-white border-2 border-black p-6 max-w-2xl" style={{borderRadius:'2px'}}>
+              <h2 className="text-sm font-black tracking-widest uppercase mb-3">Anthropic API 키</h2>
+              <p className="text-xs text-neutral-600 mb-3 leading-relaxed">
+                스크린샷 AI 분석에 필요합니다. API 키는 이 브라우저의 localStorage에만 저장되며 외부로 전송되지 않습니다.
+                <br/>
+                <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer" className="underline font-bold text-black">console.anthropic.com</a>에서 발급
+              </p>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="sk-ant-..."
+                className="w-full px-3 py-2 border-2 border-neutral-300 focus:border-black text-xs font-mono outline-none transition-all"
+                style={{borderRadius:'2px'}}
+              />
+              <div className="flex items-center gap-3 mt-3">
+                <button
+                  onClick={save}
+                  className="px-4 py-2 bg-black text-white text-[11px] font-black tracking-widest uppercase hover:bg-neutral-800 transition-all"
+                  style={{borderRadius:'2px'}}
+                >
+                  저장
+                </button>
+                {savedMsg && <span className="text-[11px] font-black text-green-700 tracking-widest uppercase">{savedMsg}</span>}
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
